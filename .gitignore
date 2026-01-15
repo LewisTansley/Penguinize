@@ -1,0 +1,22 @@
+# State files
+.ntfs_to_linux_fs/
+*.conf
+
+# Temporary files
+/tmp/rsync_output.*
+/tmp/ntfs_to_linux_fs_state_*
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
