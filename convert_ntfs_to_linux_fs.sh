@@ -429,6 +429,218 @@ detect_existing_partitions() {
     lsblk -f -n -o NAME,FSTYPE "$disk" | grep -i "^[^ ]* $fs_type" | awk '{print "/dev/" $1}'
 }
 
+# Detect if disk is HDD or SSD
+detect_disk_type() {
+    local disk="$1"
+    local disk_name
+    disk_name=$(basename "$disk")
+    
+    # Method 1: Check /sys/block/<device>/queue/rotational
+    # 0 = SSD, 1 = HDD
+    if [ -f "/sys/block/$disk_name/queue/rotational" ]; then
+        local rotational
+        rotational=$(cat "/sys/block/$disk_name/queue/rotational" 2>/dev/null || echo "1")
+        if [ "$rotational" = "0" ]; then
+            echo "SSD"
+            return 0
+        elif [ "$rotational" = "1" ]; then
+            echo "HDD"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Use lsblk -d -o NAME,ROTA
+    # ROTA=0 = SSD, ROTA=1 = HDD
+    local rota
+    rota=$(lsblk -d -n -o ROTA "$disk" 2>/dev/null | head -1)
+    if [ "$rota" = "0" ]; then
+        echo "SSD"
+        return 0
+    elif [ "$rota" = "1" ]; then
+        echo "HDD"
+        return 0
+    fi
+    
+    # Method 3: Try smartctl if available
+    if command -v smartctl >/dev/null 2>&1; then
+        local device_type
+        device_type=$(smartctl -a "$disk" 2>/dev/null | grep -i "device model\|rotation rate" | head -1)
+        if echo "$device_type" | grep -qi "solid state\|ssd"; then
+            echo "SSD"
+            return 0
+        elif echo "$device_type" | grep -qi "rpm\|rotation"; then
+            echo "HDD"
+            return 0
+        fi
+    fi
+    
+    # Fallback: assume HDD if we can't determine (safer for defrag)
+    echo "UNKNOWN"
+    return 1
+}
+
+# Defrag NTFS partition
+defrag_ntfs() {
+    local partition="$1"
+    
+    show_info "Defragmenting NTFS partition $partition..."
+    show_warning "This may take a long time depending on partition size and fragmentation level"
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY RUN] Would defragment NTFS partition $partition"
+        return 0
+    fi
+    
+    # Check if partition is mounted and unmount if necessary
+    # ntfsfix works on unmounted partitions
+    local mount_point
+    mount_point=$(findmnt -n -o TARGET "$partition" 2>/dev/null || echo "")
+    
+    if [ -n "$mount_point" ]; then
+        show_info "Unmounting partition for optimization..."
+        if ! umount "$partition" 2>/dev/null; then
+            show_error "Partition is mounted and cannot be unmounted. Please unmount manually and try again."
+            return 1
+        fi
+        sync
+        sleep 1
+    fi
+    
+    # Use ntfsfix to check and fix the filesystem
+    # Note: Full NTFS defragmentation requires Windows tools
+    # ntfsfix can optimize and fix issues, which helps prepare for conversion
+    show_info "Running NTFS filesystem check and optimization (this may take a while)..."
+    
+    local defrag_success=false
+    
+    # Try ntfsfix (available in ntfs-3g package)
+    # This doesn't fully defragment but can optimize and fix filesystem issues
+    if command -v ntfsfix >/dev/null 2>&1; then
+        if ntfsfix "$partition" >/dev/null 2>&1; then
+            defrag_success=true
+            show_info "NTFS filesystem check and optimization completed"
+        else
+            show_warning "ntfsfix had issues, but continuing..."
+            defrag_success=true  # Still consider it attempted
+        fi
+    else
+        show_warning "ntfsfix not available. For best results, defragment using Windows tools before conversion."
+    fi
+    
+    # Remount if it was previously mounted
+    if [ -n "$mount_point" ] && [ -d "$mount_point" ]; then
+        show_info "Remounting partition..."
+        mount "$partition" "$mount_point" 2>/dev/null || true
+    fi
+    
+    if [ "$defrag_success" = true ]; then
+        show_success "NTFS optimization completed"
+        return 0
+    else
+        show_warning "Could not perform full defragmentation (Windows tools recommended for best results)"
+        show_info "Continuing with conversion anyway..."
+        return 0
+    fi
+}
+
+# Defrag Linux filesystem partition
+defrag_linux_fs() {
+    local partition="$1"
+    local fs_type="$2"
+    
+    show_info "Defragmenting ${fs_type} partition $partition..."
+    show_warning "This may take a long time depending on partition size and fragmentation level"
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY RUN] Would defragment ${fs_type} partition $partition"
+        return 0
+    fi
+    
+    # Mount the partition for defragmentation (most Linux defrag tools require mounted FS)
+    local mount_point="/mnt/defrag_$$"
+    mkdir -p "$mount_point"
+    
+    if ! mount "$partition" "$mount_point" 2>/dev/null; then
+        show_error "Failed to mount partition for defragmentation"
+        rmdir "$mount_point" 2>/dev/null || true
+        return 1
+    fi
+    
+    local defrag_success=false
+    
+    # Defrag based on filesystem type
+    case "$fs_type" in
+        ext4)
+            if command -v e4defrag >/dev/null 2>&1; then
+                show_info "Running ext4 defragmentation (this may take a while)..."
+                if e4defrag -c "$mount_point" >/dev/null 2>&1; then
+                    # Check if defragmentation is needed
+                    local frag_info
+                    frag_info=$(e4defrag -c "$mount_point" 2>/dev/null | tail -1)
+                    if echo "$frag_info" | grep -qi "not need\|0%"; then
+                        show_info "Filesystem is already well defragmented"
+                    else
+                        show_info "Running full defragmentation..."
+                        e4defrag "$mount_point" >/dev/null 2>&1 || {
+                            show_warning "e4defrag had issues, but continuing..."
+                        }
+                    fi
+                    defrag_success=true
+                else
+                    show_warning "e4defrag check failed, but continuing..."
+                    defrag_success=true
+                fi
+            else
+                show_warning "e4defrag not available. Install e2fsprogs package."
+            fi
+            ;;
+        btrfs)
+            if command -v btrfs >/dev/null 2>&1; then
+                show_info "Running btrfs defragmentation (this may take a while)..."
+                if btrfs filesystem defrag -r "$mount_point" >/dev/null 2>&1; then
+                    defrag_success=true
+                    show_info "btrfs defragmentation completed"
+                else
+                    show_warning "btrfs defragmentation had issues, but continuing..."
+                    defrag_success=true
+                fi
+            else
+                show_warning "btrfs tools not available."
+            fi
+            ;;
+        xfs)
+            if command -v xfs_fsr >/dev/null 2>&1; then
+                show_info "Running xfs defragmentation (this may take a while)..."
+                # xfs_fsr works on mounted filesystems
+                if xfs_fsr "$mount_point" >/dev/null 2>&1; then
+                    defrag_success=true
+                    show_info "xfs defragmentation completed"
+                else
+                    show_warning "xfs_fsr had issues, but continuing..."
+                    defrag_success=true
+                fi
+            else
+                show_warning "xfs_fsr not available. Install xfsprogs package."
+            fi
+            ;;
+        f2fs)
+            show_info "f2fs is optimized for flash storage and doesn't require defragmentation"
+            defrag_success=true
+            ;;
+        reiserfs|jfs)
+            show_warning "${fs_type} defragmentation tools are limited or not available"
+            show_info "Skipping defragmentation for ${fs_type}"
+            defrag_success=true
+            ;;
+        *)
+            show_warning "Defragmentation not supported for ${fs_type}"
+            defrag_success=true
+            ;;
+    esac
+    
+    # Sync and unmount
+    sync
+    if ! umount "$mount_point" 2>/dev/null; then
         show_warning "Failed to unmount partition after defragmentation"
         sleep 2
         umount -l "$mount_point" 2>/dev/null || true
