@@ -14,11 +14,58 @@
 
 set -euo pipefail
 
+# Ensure stdout is line-buffered for immediate display updates
+# This is critical for TUI to update properly during auto-advance
+if [ -t 1 ] && command -v stdbuf >/dev/null 2>&1 && [ -z "${STDBUF_SET:-}" ]; then
+    export STDBUF_SET=1
+    # Get the full path to the script
+    SCRIPT_PATH="$0"
+    if [ "${SCRIPT_PATH#/}" = "$SCRIPT_PATH" ]; then
+        # Not an absolute path, resolve it
+        SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    fi
+    # Always use bash (not sh) with stdbuf for proper buffering
+    # This ensures the script runs with line-buffered output
+    exec stdbuf -oL -eL bash "$SCRIPT_PATH" "$@"
+    exit $?  # Should never reach here
+fi
+
+# Shell detection and compatibility
+DETECTED_SHELL=""
+if [ -n "${ZSH_VERSION:-}" ]; then
+    DETECTED_SHELL="zsh"
+elif [ -n "${BASH_VERSION:-}" ]; then
+    DETECTED_SHELL="bash"
+elif [ -n "${FISH_VERSION:-}" ]; then
+    DETECTED_SHELL="fish"
+else
+    # Try to detect from $0 or parent process
+    DETECTED_SHELL=$(basename "${SHELL:-bash}" 2>/dev/null || echo "bash")
+fi
+
+# Check if running in bash (required for this script)
+if [ "$DETECTED_SHELL" != "bash" ] && [ -z "${BASH_VERSION:-}" ]; then
+    echo "Error: This script requires bash to run properly." >&2
+    echo "Detected shell: $DETECTED_SHELL" >&2
+    echo "Please run with: bash $0" >&2
+    exit 1
+fi
+
 # Script configuration
 SCRIPT_NAME="convert_ntfs_to_linux_fs.sh"
 SCRIPT_VERSION="1.0.0"
 STATE_DIR="${HOME}/.ntfs_to_linux_fs"
 STATE_FILE=""
+
+# Compatibility function for reading input
+# Works reliably across bash, zsh, and when invoked from fish
+safe_read() {
+    # Use bash's built-in read which works even when script is invoked from other shells
+    # as long as the script itself is running in bash
+    # This is a simple wrapper that ensures read works correctly
+    IFS= read -r line || true
+    echo "$line"
+}
 
 # Color codes using tput for compatibility
 RED=$(tput setaf 1 2>/dev/null || echo "")
@@ -27,6 +74,7 @@ YELLOW=$(tput setaf 3 2>/dev/null || echo "")
 BLUE=$(tput setaf 4 2>/dev/null || echo "")
 CYAN=$(tput setaf 6 2>/dev/null || echo "")
 WHITE=$(tput setaf 7 2>/dev/null || echo "")
+DIM=$(tput dim 2>/dev/null || tput setaf 8 2>/dev/null || echo "")
 BOLD=$(tput bold 2>/dev/null || echo "")
 RESET=$(tput sgr0 2>/dev/null || echo "")
 
@@ -73,6 +121,29 @@ NTFS_MOUNT=""
 TARGET_MOUNT=""
 FILES_MIGRATED=0
 DRY_RUN=false
+DUMMY_MODE=false
+
+# Dummy mode state (for --dummy-mode)
+DUMMY_NTFS_SIZE_KB=50000000  # 50GB
+DUMMY_NTFS_USED_KB=30000000  # 30GB used
+DUMMY_DISK_SIZE_KB=100000000  # 100GB
+DUMMY_ITERATION=0
+
+# Screen layout configuration
+SCREEN_COLS=80
+SCREEN_ROWS=24
+HEADER_ROWS=2
+FOOTER_ROWS=1
+STATUS_ROW=0        # Calculated at runtime (SCREEN_ROWS - FOOTER_ROWS - 1)
+CONTENT_START_ROW=3
+CONTENT_END_ROW=0   # Calculated at runtime
+SCREEN_INITIALIZED=false
+
+# Current UI state
+CURRENT_STATUS=""
+CURRENT_PROGRESS=""
+LOG_LINES=()
+MAX_LOG_LINES=10
 
 # Filesystem definitions
 declare -A FS_PACKAGES
@@ -112,17 +183,462 @@ FS_DESCRIPTIONS[jfs]="Journaling filesystem (limited resize capabilities)"
 # Utility Functions
 ###############################################################################
 
+# Strip ANSI escape sequences from a string
+strip_ansi() {
+    local text="$1"
+    # Remove ANSI escape sequences (ESC[ followed by numbers, semicolons, and ending with m)
+    echo "$text" | sed 's/\x1b\[[0-9;]*m//g'
+}
+
 # Get terminal size
 get_terminal_size() {
     local cols rows
+    local tput_cols tput_rows
+    
+    # Try tput first
     if command -v tput >/dev/null 2>&1; then
-        cols=$(tput cols 2>/dev/null || echo 80)
-        rows=$(tput lines 2>/dev/null || echo 24)
-    else
+        tput_cols=$(tput cols 2>/dev/null || echo "")
+        tput_rows=$(tput lines 2>/dev/null || echo "")
+        
+        # Validate tput output is numeric and positive
+        if [ -n "$tput_cols" ] && [ "$tput_cols" -gt 0 ] 2>/dev/null; then
+            cols="$tput_cols"
+        else
+            cols=""
+        fi
+        
+        if [ -n "$tput_rows" ] && [ "$tput_rows" -gt 0 ] 2>/dev/null; then
+            rows="$tput_rows"
+        else
+            rows=""
+        fi
+    fi
+    
+    # Fallback to environment variables if tput failed or returned invalid values
+    if [ -z "$cols" ] || [ "$cols" -le 0 ] 2>/dev/null; then
+        if [ -n "${COLUMNS:-}" ] && [ "$COLUMNS" -gt 0 ] 2>/dev/null; then
+            cols="$COLUMNS"
+        else
+            cols=80
+        fi
+    fi
+    
+    if [ -z "$rows" ] || [ "$rows" -le 0 ] 2>/dev/null; then
+        if [ -n "${LINES:-}" ] && [ "$LINES" -gt 0 ] 2>/dev/null; then
+            rows="$LINES"
+        else
+            rows=24
+        fi
+    fi
+    
+    # Ensure minimum size and validate values are numeric
+    if [ "$cols" -lt 80 ] 2>/dev/null || [ -z "$cols" ]; then
         cols=80
+    fi
+    if [ "$rows" -lt 24 ] 2>/dev/null || [ -z "$rows" ]; then
         rows=24
     fi
+    
+    # Final validation - ensure we have valid numbers
+    if ! [ "$cols" -gt 0 ] 2>/dev/null; then
+        cols=80
+    fi
+    if ! [ "$rows" -gt 0 ] 2>/dev/null; then
+        rows=24
+    fi
+    
     echo "$cols $rows"
+}
+
+###############################################################################
+# Screen Layout Management
+###############################################################################
+
+# Initialize screen layout - calculates row positions based on terminal size
+init_screen_layout() {
+    local size
+    size=$(get_terminal_size)
+    SCREEN_COLS=$(echo "$size" | cut -d' ' -f1)
+    SCREEN_ROWS=$(echo "$size" | cut -d' ' -f2)
+    
+    # Calculate dynamic row positions
+    STATUS_ROW=$((SCREEN_ROWS - FOOTER_ROWS - 1))
+    CONTENT_END_ROW=$((STATUS_ROW - 1))
+    
+    SCREEN_INITIALIZED=true
+}
+
+# Draw the static header (minimal style)
+draw_header() {
+    local title="NTFS to Linux Converter"
+    local version="v${SCRIPT_VERSION}"
+    
+    # Position at top
+    tput cup 0 0 >/dev/tty 2>/dev/null || true
+    
+    # Clear header area
+    printf "%-${SCREEN_COLS}s" "" >/dev/tty
+    tput cup 0 0 >/dev/tty 2>/dev/null || true
+    
+    # Draw title line
+    printf " ${BOLD}${CYAN}%s${RESET}" "$title" >/dev/tty
+    
+    # Draw version right-aligned
+    local version_col=$((SCREEN_COLS - ${#version} - 1))
+    tput cup 0 $version_col >/dev/tty 2>/dev/null || true
+    printf "${DIM}%s${RESET}" "$version" >/dev/tty
+    
+    # Draw separator line
+    tput cup 1 0 >/dev/tty 2>/dev/null || true
+    printf " ${DIM}" >/dev/tty
+    local i
+    for ((i=0; i<SCREEN_COLS-2; i++)); do
+        printf "%s" "$BOX_H" >/dev/tty
+    done
+    printf "${RESET}" >/dev/tty
+}
+
+# Draw the static footer with help text
+draw_footer() {
+    local help_text="^/v Navigate | Enter Select | q Quit | ESC Back"
+    
+    tput cup $((SCREEN_ROWS - 1)) 0 >/dev/tty 2>/dev/null || true
+    printf " ${DIM}%s${RESET}" "$help_text" >/dev/tty
+    
+    # Fill rest of line
+    local help_len=${#help_text}
+    local remaining=$((SCREEN_COLS - help_len - 2))
+    if [ $remaining -gt 0 ]; then
+        printf "%*s" $remaining "" >/dev/tty
+    fi
+}
+
+# Draw the status bar
+draw_status_bar() {
+    local status="${1:-}"
+    local progress="${2:-}"
+    
+    tput cup $STATUS_ROW 0 >/dev/tty 2>/dev/null || true
+    
+    # Draw separator above status bar
+    printf " ${DIM}" >/dev/tty
+    local i
+    for ((i=0; i<SCREEN_COLS-2; i++)); do
+        printf "%s" "$BOX_H" >/dev/tty
+    done
+    printf "${RESET}" >/dev/tty
+    
+    # Move to status bar line
+    tput cup $((STATUS_ROW + 1)) 0 >/dev/tty 2>/dev/null || true
+    
+    if [ -n "$status" ]; then
+        printf " ${CYAN}%s${RESET}" "$status" >/dev/tty
+        if [ -n "$progress" ]; then
+            printf " ${DIM}|${RESET} %s" "$progress" >/dev/tty
+        fi
+    fi
+    
+    # Clear to end of line
+    tput el >/dev/tty 2>/dev/null || true
+    
+    # Store current status
+    CURRENT_STATUS="$status"
+    CURRENT_PROGRESS="$progress"
+}
+
+# Update only the status bar (no screen clear)
+update_status_bar() {
+    local status="${1:-$CURRENT_STATUS}"
+    local progress="${2:-}"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen_layout
+    fi
+    
+    # Keep cursor hidden during UI updates
+    tput civis >/dev/tty 2>/dev/null || true
+    
+    draw_status_bar "$status" "$progress"
+}
+
+# Clear only the content area (not header/footer/status)
+clear_content_area() {
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen_layout
+    fi
+    
+    local row
+    for ((row=CONTENT_START_ROW; row<=CONTENT_END_ROW; row++)); do
+        tput cup $row 0 >/dev/tty 2>/dev/null || true
+        tput el >/dev/tty 2>/dev/null || true
+    done
+    
+    # Position cursor at start of content area
+    tput cup $CONTENT_START_ROW 1 >/dev/tty 2>/dev/null || true
+}
+
+# Initialize the full screen layout
+init_screen() {
+    init_screen_layout
+    
+    # Hide cursor during drawing
+    tput civis >/dev/tty 2>/dev/null || true
+    
+    # Clear entire screen once
+    tput clear >/dev/tty 2>/dev/null || true
+    
+    # Draw static elements
+    draw_header
+    draw_footer
+    draw_status_bar "" ""
+    
+    # Position cursor in content area
+    tput cup $CONTENT_START_ROW 1 >/dev/tty 2>/dev/null || true
+}
+
+# Cleanup screen on exit
+cleanup_screen() {
+    # Show cursor
+    tput cnorm >/dev/tty 2>/dev/null || true
+    # Move to bottom of screen
+    tput cup $((SCREEN_ROWS - 1)) 0 >/dev/tty 2>/dev/null || true
+    printf "\n" >/dev/tty
+}
+
+# Get the number of available content rows
+get_content_rows() {
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen_layout
+    fi
+    echo $((CONTENT_END_ROW - CONTENT_START_ROW + 1))
+}
+
+# Write text at a specific row in content area (0-indexed from content start)
+write_content_line() {
+    local row="$1"
+    local text="$2"
+    local actual_row=$((CONTENT_START_ROW + row))
+    
+    if [ $actual_row -le $CONTENT_END_ROW ]; then
+        tput cup $actual_row 1 >/dev/tty 2>/dev/null || true
+        printf "%s" "$text" >/dev/tty
+        tput el >/dev/tty 2>/dev/null || true
+    fi
+}
+
+# Add a message to the log display (scrolling log in content area)
+log_message() {
+    local message="$1"
+    local level="${2:-info}"  # info, success, warning, error
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen_layout
+    fi
+    
+    # Keep cursor hidden during UI updates
+    tput civis >/dev/tty 2>/dev/null || true
+    
+    # Add color prefix based on level
+    local colored_msg
+    case "$level" in
+        success) colored_msg="${GREEN}${CHECK}${RESET} $message" ;;
+        warning) colored_msg="${YELLOW}${WARN}${RESET} $message" ;;
+        error)   colored_msg="${RED}${CROSS}${RESET} $message" ;;
+        *)       colored_msg="${CYAN}${ARROW_R}${RESET} $message" ;;
+    esac
+    
+    # Add to log array
+    LOG_LINES+=("$colored_msg")
+    
+    # Keep only last MAX_LOG_LINES entries
+    local log_count=${#LOG_LINES[@]}
+    if [ $log_count -gt $MAX_LOG_LINES ]; then
+        LOG_LINES=("${LOG_LINES[@]:$((log_count - MAX_LOG_LINES))}")
+    fi
+    
+    # Render log to content area
+    render_log
+}
+
+# Render the log lines to the content area
+render_log() {
+    local content_rows
+    content_rows=$(get_content_rows)
+    local log_count=${#LOG_LINES[@]}
+    local start_row=0
+    
+    # Calculate starting position to show most recent logs at bottom
+    if [ $log_count -lt $content_rows ]; then
+        start_row=$((content_rows - log_count - 1))
+    fi
+    
+    # Clear content area first
+    clear_content_area
+    
+    # Write each log line
+    local i
+    local row=$start_row
+    for ((i=0; i<log_count && row<content_rows; i++, row++)); do
+        write_content_line $row "${LOG_LINES[$i]}"
+    done
+}
+
+# Clear the log
+clear_log() {
+    LOG_LINES=()
+    clear_content_area
+}
+
+# Show a panel in the content area (for menus, info displays)
+# This clears content area and renders the panel content
+show_panel() {
+    local title="$1"
+    local content="$2"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    # Keep cursor hidden during UI updates
+    tput civis >/dev/tty 2>/dev/null || true
+    
+    clear_content_area
+    
+    # Draw panel title
+    write_content_line 0 "${BOLD}${CYAN}$title${RESET}"
+    write_content_line 1 ""
+    
+    # Draw content lines
+    local line_num=2
+    while IFS= read -r line; do
+        write_content_line $line_num "$line"
+        ((line_num++))
+    done <<< "$content"
+}
+
+# Show a modal dialog (saves/restores screen state)
+show_modal() {
+    local title="$1"
+    local message="$2"
+    local type="${3:-info}"  # info, success, warning, error
+    local wait_for_key="${4:-true}"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    # Keep cursor hidden during UI updates
+    tput civis >/dev/tty 2>/dev/null || true
+    
+    clear_content_area
+    
+    # Set color based on type
+    local title_color
+    case "$type" in
+        success) title_color="$GREEN" ;;
+        warning) title_color="$YELLOW" ;;
+        error)   title_color="$RED" ;;
+        *)       title_color="$CYAN" ;;
+    esac
+    
+    # Draw modal title
+    write_content_line 0 "${BOLD}${title_color}$title${RESET}"
+    write_content_line 1 ""
+    
+    # Draw message lines
+    local line_num=2
+    while IFS= read -r line; do
+        write_content_line $line_num " $line"
+        ((line_num++))
+    done <<< "$message"
+    
+    if [ "$wait_for_key" = "true" ]; then
+        ((line_num++))
+        write_content_line $line_num ""
+        write_content_line $((line_num + 1)) "${DIM}Press Enter to continue...${RESET}"
+        
+        # Wait for key press
+        read -rsn1 </dev/tty 2>/dev/null || true
+    fi
+}
+
+# Draw a progress bar at the current cursor position
+draw_inline_progress() {
+    local current="$1"
+    local total="$2"
+    local width="${3:-30}"
+    local label="${4:-}"
+    
+    local percent=0
+    if [ "$total" -gt 0 ]; then
+        percent=$((current * 100 / total))
+    fi
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+    
+    local bar="["
+    local i
+    for ((i=0; i<filled; i++)); do bar+="="; done
+    for ((i=0; i<empty; i++)); do bar+="-"; done
+    bar+="]"
+    
+    if [ -n "$label" ]; then
+        printf "%s %s %3d%%" "$label" "$bar" "$percent"
+    else
+        printf "%s %3d%%" "$bar" "$percent"
+    fi
+}
+
+# Render a progress display panel
+render_progress_panel() {
+    local title="$1"
+    local source_label="$2"
+    local target_label="$3"
+    local iteration_current="$4"
+    local iteration_total="$5"
+    local progress_percent="$6"
+    local files_current="$7"
+    local files_total="$8"
+    local current_op="$9"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    # Keep cursor hidden during UI updates
+    tput civis >/dev/tty 2>/dev/null || true
+    
+    clear_content_area
+    
+    # Title
+    write_content_line 0 "${BOLD}${CYAN}$title${RESET}"
+    write_content_line 1 ""
+    
+    # Source/Target info
+    write_content_line 2 " Source:    ${BOLD}$source_label${RESET}"
+    write_content_line 3 " Target:    ${BOLD}$target_label${RESET}"
+    write_content_line 4 ""
+    
+    # Progress bars
+    local iter_bar
+    iter_bar=$(draw_inline_progress "$iteration_current" "$iteration_total" 20)
+    write_content_line 5 " Iteration  $iter_bar  $iteration_current / $iteration_total"
+    
+    local prog_bar
+    prog_bar=$(draw_inline_progress "$progress_percent" 100 20)
+    write_content_line 6 " Progress   $prog_bar"
+    
+    if [ "$files_total" -gt 0 ]; then
+        local files_bar
+        files_bar=$(draw_inline_progress "$files_current" "$files_total" 20)
+        write_content_line 7 " Files      $files_bar  $files_current / $files_total"
+    fi
+    
+    write_content_line 8 ""
+    write_content_line 9 " ${DIM}Current:${RESET} $current_op"
+    
+    # Update status bar
+    update_status_bar "$current_op" "${progress_percent}%"
 }
 
 # Center text
@@ -130,56 +646,93 @@ center_text() {
     local text="$1"
     local width
     width=$(get_terminal_size | cut -d' ' -f1)
-    local padding=$(( (width - ${#text}) / 2 ))
-    printf "%*s%s\n" $padding "" "$text"
+    local text_stripped
+    text_stripped=$(strip_ansi "$text")
+    local padding=$(( (width - ${#text_stripped}) / 2 ))
+    printf "%*s%s\n" $padding "" "$text" >/dev/tty 2>/dev/null || printf "%*s%s\n" $padding "" "$text"
 }
 
-# Clear screen
+# Clear screen using cursor positioning (prevents flickering)
 clear_screen() {
     if command -v tput >/dev/null 2>&1; then
-        tput clear
+        # Use cursor positioning instead of full clear to prevent flickering
+        # Move to home position and clear to end of screen
+        tput cup 0 0 >/dev/tty 2>/dev/null || true
+        tput ed >/dev/tty 2>/dev/null || true
     else
-        clear
+        clear >/dev/tty 2>/dev/null || clear
     fi
+    # Force output flush
+    sync >/dev/null 2>&1 || true
 }
 
-# Draw a box
+# Draw a box (returns output as string for double buffering)
 draw_box() {
     local width="$1"
     local title="$2"
     local content="$3"
     
-    local title_len=${#title}
+    local title_stripped
+    title_stripped=$(strip_ansi "$title")
+    local title_len=${#title_stripped}
     local title_pad=$(( (width - title_len - 2) / 2 ))
     
+    local box_output=""
+    
     # Top border
-    echo -n "${BOX_TL}"
-    for ((i=0; i<width-2; i++)); do echo -n "${BOX_H}"; done
-    echo "${BOX_TR}"
+    box_output+="${BOX_TL}"
+    local i
+    for ((i=0; i<width-2; i++)); do box_output+="${BOX_H}"; done
+    box_output+="${BOX_TR}\n"
     
     # Title line
-    echo -n "${BOX_V}"
-    printf "%*s" $title_pad ""
-    echo -n "${BOLD}${CYAN}${title}${RESET}"
-    printf "%*s" $((width - title_pad - title_len - 2)) ""
-    echo "${BOX_V}"
+    box_output+="${BOX_V}"
+    local j
+    for ((j=0; j<title_pad; j++)); do box_output+=" "; done
+    local title_with_colors="${BOLD}${CYAN}${title}${RESET}"
+    box_output+="$title_with_colors"
+    local title_display_len=$title_len
+    local right_pad=$((width - title_pad - title_display_len - 2))
+    if [ $right_pad -lt 0 ]; then
+        right_pad=0
+    fi
+    for ((j=0; j<right_pad; j++)); do box_output+=" "; done
+    box_output+="${BOX_V}\n"
     
     # Separator
-    echo -n "${BOX_T}"
-    for ((i=0; i<width-2; i++)); do echo -n "${BOX_H}"; done
-    echo "${BOX_T}"
+    box_output+="${BOX_T}"
+    for ((i=0; i<width-2; i++)); do box_output+="${BOX_H}"; done
+    box_output+="${BOX_T}\n"
     
-    # Content
-    echo "$content" | while IFS= read -r line; do
-        echo -n "${BOX_V}"
-        printf "%-$((width-2))s" "$line"
-        echo "${BOX_V}"
-    done
+    # Content - process line by line
+    # Use a method that works in all shells (sh, bash, zsh, fish)
+    # Split content by newlines and process each line
+    local content_processed
+    content_processed=$(printf "%s\n" "$content" | {
+        local line_output=""
+        while IFS= read -r line || [ -n "${line:-}" ]; do
+            line_output+="${BOX_V}"
+            local line_len=${#line}
+            line_output+="$line"
+            # Pad line to width-2
+            local pad_needed=$((width - 2 - line_len))
+            if [ $pad_needed -gt 0 ]; then
+                local k
+                for ((k=0; k<pad_needed; k++)); do line_output+=" "; done
+            fi
+            line_output+="${BOX_V}\n"
+        done
+        printf "%s" "$line_output"
+    })
+    box_output+="$content_processed"
     
     # Bottom border
-    echo -n "${BOX_BL}"
-    for ((i=0; i<width-2; i++)); do echo -n "${BOX_H}"; done
-    echo "${BOX_BR}"
+    box_output+="${BOX_BL}"
+    for ((i=0; i<width-2; i++)); do box_output+="${BOX_H}"; done
+    box_output+="${BOX_BR}\n"
+    
+    # Use printf to output, but we'll use %b when printing to interpret \n
+    printf "%s" "$box_output"
 }
 
 # Show spinner
@@ -190,10 +743,10 @@ show_spinner() {
     local i=0
     while kill -0 $pid 2>/dev/null; do
         i=$(( (i+1) %4 ))
-        printf "\r${CYAN}${spin:$i:1}${RESET} $message"
+        printf "\r${CYAN}${spin:$i:1}${RESET} $message" >/dev/tty 2>/dev/null || printf "\r${CYAN}${spin:$i:1}${RESET} $message"
         sleep 0.1
     done
-    printf "\r${GREEN}${CHECK}${RESET} $message\n"
+    printf "\r${GREEN}${CHECK}${RESET} $message\n" >/dev/tty 2>/dev/null || printf "\r${GREEN}${CHECK}${RESET} $message\n"
 }
 
 # Show progress bar
@@ -205,146 +758,355 @@ draw_progress_bar() {
     local filled=$(( current * width / total ))
     local empty=$(( width - filled ))
     
-    printf "\r["
-    for ((i=0; i<filled; i++)); do printf "█"; done
-    for ((i=0; i<empty; i++)); do printf "░"; done
-    printf "] %3d%%" "$percent"
+    local progress_bar="\r["
+    local i
+    for ((i=0; i<filled; i++)); do progress_bar+="█"; done
+    for ((i=0; i<empty; i++)); do progress_bar+="░"; done
+    progress_bar+="] ${percent}%%"
+    printf "%s" "$progress_bar" >/dev/tty 2>/dev/null || printf "%s" "$progress_bar"
 }
 
-# Print header
+# Print header (returns output as string for double buffering)
 print_header() {
-    clear_screen
     local width
     width=$(get_terminal_size | cut -d' ' -f1)
     
-    echo ""
-    center_text "${BOLD}${CYAN}╔══════════════════════════════════════════════════╗${RESET}"
-    center_text "${BOLD}${CYAN}║${RESET}  ${BOLD}NTFS to Linux Filesystem Converter${RESET}  ${BOLD}${CYAN}║${RESET}"
-    center_text "${BOLD}${CYAN}╚══════════════════════════════════════════════════╝${RESET}"
-    echo ""
+    local header_output=""
+    header_output+="\n"
+    
+    local text1="${BOLD}${CYAN}╔══════════════════════════════════════════════════╗${RESET}"
+    local text1_stripped
+    text1_stripped=$(strip_ansi "$text1")
+    local padding1=$(( (width - ${#text1_stripped}) / 2 ))
+    local j
+    for ((j=0; j<padding1; j++)); do header_output+=" "; done
+    header_output+="$text1\n"
+    
+    local text2="${BOLD}${CYAN}║${RESET}  ${BOLD}NTFS to Linux Filesystem Converter${RESET}  ${BOLD}${CYAN}║${RESET}"
+    local text2_stripped
+    text2_stripped=$(strip_ansi "$text2")
+    local padding2=$(( (width - ${#text2_stripped}) / 2 ))
+    for ((j=0; j<padding2; j++)); do header_output+=" "; done
+    header_output+="$text2\n"
+    
+    local text3="${BOLD}${CYAN}╚══════════════════════════════════════════════════╝${RESET}"
+    local text3_stripped
+    text3_stripped=$(strip_ansi "$text3")
+    local padding3=$(( (width - ${#text3_stripped}) / 2 ))
+    for ((j=0; j<padding3; j++)); do header_output+=" "; done
+    header_output+="$text3\n"
+    
+    header_output+="\n"
+    
+    echo -n "$header_output"
 }
 
-# Print footer
+# Print footer (returns output as string for double buffering)
 print_footer() {
     local width
     width=$(get_terminal_size | cut -d' ' -f1)
-    echo ""
-    echo -n "${BOX_TL}"
-    for ((i=0; i<width-2; i++)); do echo -n "${BOX_H}"; done
-    echo "${BOX_TR}"
-    echo -n "${BOX_V}"
-    printf " %-20s │ %-20s │ %-20s " "↑↓ Navigate" "Enter Select" "ESC Cancel"
-    printf "%*s" $((width - 67)) ""
-    echo "${BOX_V}"
-    echo -n "${BOX_BL}"
-    for ((i=0; i<width-2; i++)); do echo -n "${BOX_H}"; done
-    echo "${BOX_BR}"
+    
+    local footer_output=""
+    footer_output+="\n"
+    footer_output+="${BOX_TL}"
+    local i
+    for ((i=0; i<width-2; i++)); do footer_output+="${BOX_H}"; done
+    footer_output+="${BOX_TR}\n"
+    footer_output+="${BOX_V}"
+    
+    local help_text=" ↑↓ Navigate │ Enter Select │ ESC Cancel "
+    local help_text_stripped
+    help_text_stripped=$(strip_ansi "$help_text")
+    local help_len=${#help_text_stripped}
+    local help_pad=$(( (width - help_len - 2) / 2 ))
+    if [ $help_pad -lt 0 ]; then
+        help_pad=0
+    fi
+    local j
+    for ((j=0; j<help_pad; j++)); do footer_output+=" "; done
+    footer_output+="$help_text"
+    local remaining=$((width - help_pad - help_len - 2))
+    if [ $remaining -lt 0 ]; then
+        remaining=0
+    fi
+    for ((j=0; j<remaining; j++)); do footer_output+=" "; done
+    footer_output+="${BOX_V}\n"
+    footer_output+="${BOX_BL}"
+    for ((i=0; i<width-2; i++)); do footer_output+="${BOX_H}"; done
+    footer_output+="${BOX_BR}\n"
+    
+    echo -n "$footer_output"
 }
 
-# Show menu
+# Show menu - uses partial screen updates (only redraws changed lines)
 show_menu() {
     local title="$1"
     shift
     local options=("$@")
     local selected=0
     local key
-    local width
-    width=$(get_terminal_size | cut -d' ' -f1)
+    
+    # Ensure screen is initialized
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
     
     # Save terminal settings
     local old_stty
-    old_stty=$(stty -g)
-    stty -echo -icanon time 0 min 0
+    if command -v stty >/dev/null 2>&1; then
+        old_stty=$(stty -g </dev/tty 2>/dev/null || echo "")
+        if [ -n "$old_stty" ]; then
+            stty -echo -icanon time 1 min 0 </dev/tty 2>/dev/null || true
+            stty intr '' quit '' </dev/tty 2>/dev/null || true
+        fi
+    else
+        old_stty=""
+    fi
+    
+    # Hide cursor
+    tput civis >/dev/tty 2>/dev/null || true
+    
+    # Update status bar with menu context
+    update_status_bar "Select an option" ""
+    
+    # Menu item row offset (after title and blank line)
+    local menu_row_offset=2
+    
+    # Track previous selection for optimized redraw
+    local previous_selected=-1
+    local needs_full_draw=true
     
     while true; do
-        clear_screen
-        print_header
-        
-        # Draw menu box
-        local menu_content=""
-        for ((i=0; i<${#options[@]}; i++)); do
-            if [ $i -eq $selected ]; then
-                menu_content+="${BOLD}${CYAN}${ARROW_R}${RESET} ${BOLD}${options[$i]}${RESET}\n"
-            else
-                menu_content+="   ${options[$i]}\n"
+        if [ "$needs_full_draw" = true ]; then
+            # Full initial draw - clear content and draw everything
+            clear_content_area
+            
+            # Draw menu title
+            write_content_line 0 "${BOLD}${CYAN}$title${RESET}"
+            write_content_line 1 ""
+            
+            # Draw all menu options
+            local i
+            for ((i=0; i<${#options[@]}; i++)); do
+                local row=$((menu_row_offset + i))
+                if [ $i -eq $selected ]; then
+                    write_content_line $row " ${CYAN}${ARROW_R}${RESET} ${BOLD}${options[$i]}${RESET}"
+                else
+                    write_content_line $row "   ${options[$i]}"
+                fi
+            done
+            
+            previous_selected=$selected
+            needs_full_draw=false
+            
+        elif [ "$previous_selected" -ne "$selected" ]; then
+            # Optimized redraw - only update the two changed lines
+            
+            # Clear highlight from previous selection
+            if [ $previous_selected -ge 0 ]; then
+                local prev_row=$((menu_row_offset + previous_selected))
+                write_content_line $prev_row "   ${options[$previous_selected]}"
             fi
-        done
-        
-        local box_content=$(printf "$menu_content")
-        draw_box "$width" "$title" "$box_content"
-        print_footer
+            
+            # Add highlight to new selection
+            local new_row=$((menu_row_offset + selected))
+            write_content_line $new_row " ${CYAN}${ARROW_R}${RESET} ${BOLD}${options[$selected]}${RESET}"
+            
+            previous_selected=$selected
+        fi
         
         # Read key
-        key=$(dd bs=1 count=1 2>/dev/null || echo "")
+        local key=""
+        local read_status=0
+        IFS= read -rsn1 -t 0.2 key </dev/tty 2>/dev/null
+        read_status=$?
+        
+        # Check for timeout
+        if [ $read_status -gt 128 ]; then
+            continue
+        fi
+        
+        # Check for Enter key
+        if [ -z "$key" ] || [ "$key" = $'\r' ] || [ "$key" = $'\n' ]; then
+            # Restore terminal settings but keep cursor hidden
+            if [ -n "$old_stty" ]; then
+                stty "$old_stty" </dev/tty 2>/dev/null || true
+            fi
+            echo $selected
+            return
+        fi
         
         case "$key" in
             $'\033')
                 # Escape sequence
-                key=$(dd bs=1 count=2 2>/dev/null || echo "")
-                case "$key" in
-                    '[A') selected=$(( (selected - 1 + ${#options[@]}) % ${#options[@]} )) ;;
-                    '[B') selected=$(( (selected + 1) % ${#options[@]} )) ;;
+                local char1="" char2=""
+                if IFS= read -rsn1 -t 0.05 char1 </dev/tty 2>/dev/null; then
+                    IFS= read -rsn1 -t 0.05 char2 </dev/tty 2>/dev/null || true
+                fi
+                
+                local esc_seq="${char1}${char2}"
+                
+                case "$esc_seq" in
+                    '[A') 
+                        # Up arrow
+                        selected=$(( (selected - 1 + ${#options[@]}) % ${#options[@]} ))
+                        ;;
+                    '[B') 
+                        # Down arrow
+                        selected=$(( (selected + 1) % ${#options[@]} ))
+                        ;;
+                    '[C'|'[D')
+                        # Left/Right - ignore
+                        ;;
+                    *)
+                        # Plain Escape - cancel
+                        if [ -n "$old_stty" ]; then
+                            stty "$old_stty" </dev/tty 2>/dev/null || true
+                        fi
+                        echo -1
+                        return
+                        ;;
                 esac
                 ;;
-            $'\n'|$'\r')
-                # Enter
-                stty "$old_stty"
-                echo $selected
-                return
-                ;;
             $'\177'|$'\b')
-                # Backspace/Delete (treat as ESC)
-                stty "$old_stty"
+                # Backspace - cancel
+                if [ -n "$old_stty" ]; then
+                    stty "$old_stty" </dev/tty 2>/dev/null || true
+                fi
                 echo -1
                 return
                 ;;
             'q'|'Q')
                 # Quit
-                stty "$old_stty"
+                if [ -n "$old_stty" ]; then
+                    stty "$old_stty" </dev/tty 2>/dev/null || true
+                fi
                 echo -1
                 return
+                ;;
+            'k'|'K')
+                # Vim-style up
+                selected=$(( (selected - 1 + ${#options[@]}) % ${#options[@]} ))
+                ;;
+            'j'|'J')
+                # Vim-style down
+                selected=$(( (selected + 1) % ${#options[@]} ))
                 ;;
         esac
     done
 }
 
-# Show message box
+# Show message box - uses partial screen updates
+# For modal messages (require user input), use show_modal behavior
+# For status messages (auto advance), use log_message + status bar
 show_message() {
     local title="$1"
     local message="$2"
     local color="$3"
-    local width
-    width=$(get_terminal_size | cut -d' ' -f1)
+    local auto_advance="${4:-false}"
+    local delay="${5:-2}"
     
-    clear_screen
-    print_header
+    # Ensure screen is initialized
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
     
-    local content="${color}${message}${RESET}"
-    draw_box "$width" "$title" "$content"
+    # Determine message type from color
+    local msg_type="info"
+    if [ "$color" = "$RED" ]; then
+        msg_type="error"
+    elif [ "$color" = "$YELLOW" ]; then
+        msg_type="warning"
+    elif [ "$color" = "$GREEN" ]; then
+        msg_type="success"
+    fi
     
-    echo ""
-    center_text "Press Enter to continue..."
-    read -r
+    if [ "$auto_advance" = "true" ]; then
+        # For auto-advance messages, use log + status bar (no full screen clear)
+        log_message "$message" "$msg_type"
+        update_status_bar "$title: $message"
+        sleep "$delay"
+    else
+        # For modal messages, use show_modal
+        show_modal "$title" "$message" "$msg_type" "true"
+    fi
 }
 
-# Show error
+# Show error - logs error and optionally waits for user
 show_error() {
-    show_message "Error" "$1" "$RED"
+    local message="$1"
+    local wait_for_key="${2:-true}"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    log_message "$message" "error"
+    update_status_bar "Error: $message"
+    
+    if [ "$wait_for_key" = "true" ]; then
+        show_modal "Error" "$message" "error" "true"
+    fi
 }
 
-# Show warning
+# Show warning - logs warning and optionally waits for user
 show_warning() {
-    show_message "Warning" "$1" "$YELLOW"
+    local message="$1"
+    local wait_for_key="${2:-false}"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    log_message "$message" "warning"
+    update_status_bar "Warning: $message"
+    
+    if [ "$wait_for_key" = "true" ]; then
+        show_modal "Warning" "$message" "warning" "true"
+    fi
 }
 
-# Show success
+# Show success - logs success and optionally waits for user
 show_success() {
-    show_message "Success" "$1" "$GREEN"
+    local message="$1"
+    local wait_for_key="${2:-false}"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    log_message "$message" "success"
+    update_status_bar "Success: $message"
+    
+    if [ "$wait_for_key" = "true" ]; then
+        show_modal "Success" "$message" "success" "true"
+    fi
 }
 
-# Show info
+# Show info - logs info message (no screen clear, no wait)
 show_info() {
-    show_message "Information" "$1" "$CYAN"
+    local message="$1"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    log_message "$message" "info"
+    update_status_bar "$message"
+}
+
+# Show info with auto-advance - logs message and brief delay
+show_info_auto() {
+    local message="$1"
+    local delay="${2:-1}"
+    
+    if [ "$SCREEN_INITIALIZED" != true ]; then
+        init_screen
+    fi
+    
+    log_message "$message" "info"
+    update_status_bar "$message"
+    sleep "$delay"
 }
 
 ###############################################################################
@@ -352,6 +1114,9 @@ show_info() {
 ###############################################################################
 
 check_root() {
+    if [ "$DUMMY_MODE" = true ]; then
+        return 0  # Skip root check in dummy mode
+    fi
     if [ "$EUID" -ne 0 ]; then
         show_error "This script must be run as root or with sudo"
         exit 1
@@ -360,6 +1125,11 @@ check_root() {
 
 check_dependencies() {
     local fs_type="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        # Skip dependency checks in dummy mode
+        show_info_auto "Dummy mode: Skipping dependency checks" 1
+        return 0
+    fi
     local missing_packages=()
     
     # Base dependencies
@@ -380,12 +1150,12 @@ check_dependencies() {
     fi
     
     if [ ${#missing_packages[@]} -gt 0 ]; then
-        show_info "Installing missing packages: ${missing_packages[*]}"
+        show_info_auto "Installing missing packages: ${missing_packages[*]}" 1
         if ! pacman -S --noconfirm "${missing_packages[@]}" >/dev/null 2>&1; then
             show_error "Failed to install packages. Please install manually: ${missing_packages[*]}"
             exit 1
         fi
-        show_success "Packages installed successfully"
+        show_message "Success" "Packages installed successfully" "$GREEN" "true" 1
     fi
 }
 
@@ -394,6 +1164,10 @@ check_dependencies() {
 ###############################################################################
 
 list_disks() {
+    if [ "$DUMMY_MODE" = true ]; then
+        echo "/dev/sda - 100G - Dummy Test Disk"
+        return 0
+    fi
     lsblk -d -n -o NAME,SIZE,MODEL | grep -E '^[a-z]' | awk '{print "/dev/" $1 " - " $2 " - " substr($0, index($0,$3))}'
 }
 
@@ -420,18 +1194,30 @@ select_disk() {
 
 detect_ntfs_partitions() {
     local disk="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        echo "/dev/sda1"
+        return 0
+    fi
     lsblk -f -n -o NAME,FSTYPE "$disk" | grep -i ntfs | awk '{print "/dev/" $1}' | head -1
 }
 
 detect_existing_partitions() {
     local disk="$1"
     local fs_type="$2"
+    if [ "$DUMMY_MODE" = true ]; then
+        # Return empty in dummy mode (no existing partitions)
+        return 0
+    fi
     lsblk -f -n -o NAME,FSTYPE "$disk" | grep -i "^[^ ]* $fs_type" | awk '{print "/dev/" $1}'
 }
 
 # Detect if disk is HDD or SSD
 detect_disk_type() {
     local disk="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        echo "HDD"  # Return HDD for dummy mode to test defrag flow
+        return 0
+    fi
     local disk_name
     disk_name=$(basename "$disk")
     
@@ -483,8 +1269,29 @@ detect_disk_type() {
 defrag_ntfs() {
     local partition="$1"
     
-    show_info "Defragmenting NTFS partition $partition..."
-    show_warning "This may take a long time depending on partition size and fragmentation level"
+    # SAFETY: Never defrag SSDs - derive disk from partition and check
+    local disk
+    disk=$(echo "$partition" | sed 's/[0-9]*$//')
+    local disk_type
+    disk_type=$(detect_disk_type "$disk")
+    
+    if [ "$disk_type" = "SSD" ]; then
+        log_message "Defragmentation skipped - SSD detected (defrag harmful to SSDs)" "warning"
+        return 0
+    fi
+    
+    if [ "$disk_type" = "UNKNOWN" ]; then
+        log_message "Defragmentation skipped - cannot confirm disk is HDD (safety precaution)" "warning"
+        return 0
+    fi
+    
+    show_info_auto "Defragmenting NTFS partition $partition..." 1
+    show_message "Warning" "This may take a long time depending on partition size and fragmentation level" "$YELLOW" "true" 2
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 2  # Simulate defragmentation time
+        return 0
+    fi
     
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY RUN] Would defragment NTFS partition $partition"
@@ -497,7 +1304,7 @@ defrag_ntfs() {
     mount_point=$(findmnt -n -o TARGET "$partition" 2>/dev/null || echo "")
     
     if [ -n "$mount_point" ]; then
-        show_info "Unmounting partition for optimization..."
+        show_info_auto "Unmounting partition for optimization..." 1
         if ! umount "$partition" 2>/dev/null; then
             show_error "Partition is mounted and cannot be unmounted. Please unmount manually and try again."
             return 1
@@ -509,7 +1316,7 @@ defrag_ntfs() {
     # Use ntfsfix to check and fix the filesystem
     # Note: Full NTFS defragmentation requires Windows tools
     # ntfsfix can optimize and fix issues, which helps prepare for conversion
-    show_info "Running NTFS filesystem check and optimization (this may take a while)..."
+    show_info_auto "Running NTFS filesystem check and optimization (this may take a while)..." 1
     
     local defrag_success=false
     
@@ -518,7 +1325,7 @@ defrag_ntfs() {
     if command -v ntfsfix >/dev/null 2>&1; then
         if ntfsfix "$partition" >/dev/null 2>&1; then
             defrag_success=true
-            show_info "NTFS filesystem check and optimization completed"
+            show_info_auto "NTFS filesystem check and optimization completed" 1
         else
             show_warning "ntfsfix had issues, but continuing..."
             defrag_success=true  # Still consider it attempted
@@ -529,7 +1336,7 @@ defrag_ntfs() {
     
     # Remount if it was previously mounted
     if [ -n "$mount_point" ] && [ -d "$mount_point" ]; then
-        show_info "Remounting partition..."
+        show_info_auto "Remounting partition..." 1
         mount "$partition" "$mount_point" 2>/dev/null || true
     fi
     
@@ -548,8 +1355,29 @@ defrag_linux_fs() {
     local partition="$1"
     local fs_type="$2"
     
-    show_info "Defragmenting ${fs_type} partition $partition..."
-    show_warning "This may take a long time depending on partition size and fragmentation level"
+    # SAFETY: Never defrag SSDs - derive disk from partition and check
+    local disk
+    disk=$(echo "$partition" | sed 's/[0-9]*$//')
+    local disk_type
+    disk_type=$(detect_disk_type "$disk")
+    
+    if [ "$disk_type" = "SSD" ]; then
+        log_message "Defragmentation skipped - SSD detected (defrag harmful to SSDs)" "warning"
+        return 0
+    fi
+    
+    if [ "$disk_type" = "UNKNOWN" ]; then
+        log_message "Defragmentation skipped - cannot confirm disk is HDD (safety precaution)" "warning"
+        return 0
+    fi
+    
+    show_info_auto "Defragmenting ${fs_type} partition $partition..." 1
+    show_message "Warning" "This may take a long time depending on partition size and fragmentation level" "$YELLOW" "true" 2
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 2  # Simulate defragmentation time
+        return 0
+    fi
     
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY RUN] Would defragment ${fs_type} partition $partition"
@@ -572,15 +1400,15 @@ defrag_linux_fs() {
     case "$fs_type" in
         ext4)
             if command -v e4defrag >/dev/null 2>&1; then
-                show_info "Running ext4 defragmentation (this may take a while)..."
+                show_info_auto "Running ext4 defragmentation (this may take a while)..." 1
                 if e4defrag -c "$mount_point" >/dev/null 2>&1; then
                     # Check if defragmentation is needed
                     local frag_info
                     frag_info=$(e4defrag -c "$mount_point" 2>/dev/null | tail -1)
                     if echo "$frag_info" | grep -qi "not need\|0%"; then
-                        show_info "Filesystem is already well defragmented"
+                        show_info_auto "Filesystem is already well defragmented" 1
                     else
-                        show_info "Running full defragmentation..."
+                        show_info_auto "Running full defragmentation..." 1
                         e4defrag "$mount_point" >/dev/null 2>&1 || {
                             show_warning "e4defrag had issues, but continuing..."
                         }
@@ -596,10 +1424,10 @@ defrag_linux_fs() {
             ;;
         btrfs)
             if command -v btrfs >/dev/null 2>&1; then
-                show_info "Running btrfs defragmentation (this may take a while)..."
+                show_info_auto "Running btrfs defragmentation (this may take a while)..." 1
                 if btrfs filesystem defrag -r "$mount_point" >/dev/null 2>&1; then
                     defrag_success=true
-                    show_info "btrfs defragmentation completed"
+                    show_info_auto "btrfs defragmentation completed" 1
                 else
                     show_warning "btrfs defragmentation had issues, but continuing..."
                     defrag_success=true
@@ -610,11 +1438,11 @@ defrag_linux_fs() {
             ;;
         xfs)
             if command -v xfs_fsr >/dev/null 2>&1; then
-                show_info "Running xfs defragmentation (this may take a while)..."
+                show_info_auto "Running xfs defragmentation (this may take a while)..." 1
                 # xfs_fsr works on mounted filesystems
                 if xfs_fsr "$mount_point" >/dev/null 2>&1; then
                     defrag_success=true
-                    show_info "xfs defragmentation completed"
+                    show_info_auto "xfs defragmentation completed" 1
                 else
                     show_warning "xfs_fsr had issues, but continuing..."
                     defrag_success=true
@@ -662,10 +1490,9 @@ check_and_offer_defrag() {
     local ntfs_partition="$2"
     
     if [ -z "$ntfs_partition" ]; then
-        # Try to detect NTFS partition
         ntfs_partition=$(detect_ntfs_partitions "$disk")
         if [ -z "$ntfs_partition" ]; then
-            return 0  # No NTFS partition, skip defrag check
+            return 0
         fi
     fi
     
@@ -673,41 +1500,43 @@ check_and_offer_defrag() {
     local disk_type
     disk_type=$(detect_disk_type "$disk")
     
+    # SAFETY: Never offer defrag for SSDs - it reduces SSD lifespan
+    if [ "$disk_type" = "SSD" ]; then
+        log_message "SSD detected - defragmentation skipped (harmful to SSDs)" "info"
+        return 0
+    fi
+    
+    # Also skip if we can't determine disk type (safety precaution)
+    if [ "$disk_type" = "UNKNOWN" ]; then
+        log_message "Disk type unknown - defragmentation skipped (safety precaution)" "info"
+        return 0
+    fi
+    
     if [ "$disk_type" != "HDD" ]; then
-        # Not an HDD, skip defrag
         return 0
     fi
     
     # It's an HDD - confirm with user and offer defrag
-    local width
-    width=$(get_terminal_size | cut -d' ' -f1)
-    
-    clear_screen
-    print_header
-    
     local disk_name
     disk_name=$(basename "$disk")
     local disk_model
     disk_model=$(lsblk -d -n -o MODEL "$disk" 2>/dev/null | head -1 || echo "Unknown")
     
-    local confirmation_msg=""
-    confirmation_msg+="${YELLOW}${WARN} Hard Drive Detected ${WARN}${RESET}\n"
-    confirmation_msg+="\n"
-    confirmation_msg+="Disk: ${BOLD}$disk${RESET}\n"
-    confirmation_msg+="Model: ${BOLD}$disk_model${RESET}\n"
-    confirmation_msg+="Type: ${BOLD}Hard Disk Drive (HDD)${RESET}\n"
-    confirmation_msg+="\n"
-    confirmation_msg+="The selected disk has been detected as a hard disk drive.\n"
-    confirmation_msg+="Defragmenting the NTFS partition before conversion can\n"
-    confirmation_msg+="improve performance and reduce conversion time.\n"
-    confirmation_msg+="\n"
-    confirmation_msg+="${YELLOW}Please confirm this is definitely a hard drive${RESET}\n"
-    confirmation_msg+="${YELLOW}and not a solid state drive for safety.${RESET}\n"
+    # Use the new panel system
+    clear_content_area
+    write_content_line 0 "${BOLD}${YELLOW}${WARN} Hard Drive Detected${RESET}"
+    write_content_line 1 ""
+    write_content_line 2 " Disk:  ${BOLD}$disk${RESET}"
+    write_content_line 3 " Model: ${BOLD}$disk_model${RESET}"
+    write_content_line 4 " Type:  ${BOLD}Hard Disk Drive (HDD)${RESET}"
+    write_content_line 5 ""
+    write_content_line 6 " ${DIM}Defragmenting the NTFS partition before conversion"
+    write_content_line 7 " can improve performance and reduce conversion time.${RESET}"
     
-    draw_box "$width" "Hard Drive Detection" "$confirmation_msg"
-    print_footer
+    update_status_bar "Confirm disk type" ""
+    sleep 1
     
-    local options=("Yes, this is a hard drive - offer defrag" "No, this is an SSD - skip defrag" "Cancel")
+    local options=("Yes, this is an HDD - offer defrag" "No, this is an SSD - skip defrag" "Cancel")
     local selection
     selection=$(show_menu "Confirm Disk Type" "${options[@]}")
     
@@ -720,33 +1549,29 @@ check_and_offer_defrag() {
             
             case "$defrag_selection" in
                 0)
-                    # User wants to defrag
                     if defrag_ntfs "$ntfs_partition"; then
-                        show_success "Defragmentation completed. Proceeding with conversion..."
-                        sleep 2
+                        log_message "Defragmentation completed" "success"
+                        sleep 1
                     else
-                        show_warning "Defragmentation had issues, but continuing with conversion..."
-                        sleep 2
+                        log_message "Defragmentation had issues, continuing anyway" "warning"
+                        sleep 1
                     fi
                     ;;
                 1)
-                    # User skipped defrag
-                    show_info "Skipping defragmentation. Proceeding with conversion..."
+                    log_message "Skipping defragmentation" "info"
                     sleep 1
                     ;;
                 *)
-                    # User cancelled
                     exit 0
                     ;;
             esac
             ;;
         1)
             # User says it's an SSD - skip defrag
-            show_info "Skipping defragmentation (SSD detected). Proceeding with conversion..."
+            log_message "Skipping defragmentation (SSD selected)" "info"
             sleep 1
             ;;
         *)
-            # User cancelled
             exit 0
             ;;
     esac
@@ -761,52 +1586,55 @@ check_and_offer_post_conversion_defrag() {
     local fs_type="$3"
     
     if [ -z "$target_partition" ]; then
-        return 0  # No target partition, skip
+        return 0
     fi
     
     # Detect disk type
     local disk_type
     disk_type=$(detect_disk_type "$disk")
     
+    # SAFETY: Never offer defrag for SSDs - it reduces SSD lifespan
+    if [ "$disk_type" = "SSD" ]; then
+        log_message "SSD detected - post-conversion defragmentation skipped (harmful to SSDs)" "info"
+        return 0
+    fi
+    
+    # Also skip if we can't determine disk type (safety precaution)
+    if [ "$disk_type" = "UNKNOWN" ]; then
+        log_message "Disk type unknown - post-conversion defragmentation skipped (safety precaution)" "info"
+        return 0
+    fi
+    
     if [ "$disk_type" != "HDD" ]; then
-        # Not an HDD, skip defrag
         return 0
     fi
     
     # Skip defrag for filesystems that don't need it
     case "$fs_type" in
         f2fs)
-            return 0  # f2fs is SSD-optimized, doesn't need defrag
+            return 0
             ;;
     esac
     
     # It's an HDD - offer defrag for the target filesystem
-    local width
-    width=$(get_terminal_size | cut -d' ' -f1)
-    
-    clear_screen
-    print_header
-    
     local disk_name
     disk_name=$(basename "$disk")
     local disk_model
     disk_model=$(lsblk -d -n -o MODEL "$disk" 2>/dev/null | head -1 || echo "Unknown")
     
-    local confirmation_msg=""
-    confirmation_msg+="${YELLOW}${WARN} Conversion Complete ${WARN}${RESET}\n"
-    confirmation_msg+="\n"
-    confirmation_msg+="Disk: ${BOLD}$disk${RESET}\n"
-    confirmation_msg+="Model: ${BOLD}$disk_model${RESET}\n"
-    confirmation_msg+="Type: ${BOLD}Hard Disk Drive (HDD)${RESET}\n"
-    confirmation_msg+="Target: ${BOLD}${fs_type} on ${target_partition}${RESET}\n"
-    confirmation_msg+="\n"
-    confirmation_msg+="The conversion is complete. Defragmenting the new\n"
-    confirmation_msg+="${fs_type} partition can improve performance.\n"
-    confirmation_msg+="\n"
-    confirmation_msg+="${YELLOW}Would you like to defragment the ${fs_type} partition?${RESET}\n"
+    # Use the new panel system
+    clear_content_area
+    write_content_line 0 "${BOLD}${GREEN}${CHECK} Conversion Complete${RESET}"
+    write_content_line 1 ""
+    write_content_line 2 " Disk:   ${BOLD}$disk${RESET}"
+    write_content_line 3 " Model:  ${BOLD}$disk_model${RESET}"
+    write_content_line 4 " Target: ${BOLD}${fs_type} on ${target_partition}${RESET}"
+    write_content_line 5 ""
+    write_content_line 6 " ${DIM}Defragmenting the new filesystem can improve"
+    write_content_line 7 " performance on hard disk drives.${RESET}"
     
-    draw_box "$width" "Post-Conversion Defragmentation" "$confirmation_msg"
-    print_footer
+    update_status_bar "Conversion complete" ""
+    sleep 1
     
     local options=("Yes, defragment now (recommended)" "No, skip defragmentation")
     local selection
@@ -814,18 +1642,16 @@ check_and_offer_post_conversion_defrag() {
     
     case "$selection" in
         0)
-            # User wants to defrag
             if defrag_linux_fs "$target_partition" "$fs_type"; then
-                show_success "Defragmentation completed successfully!"
-                sleep 2
+                log_message "Defragmentation completed successfully" "success"
+                sleep 1
             else
-                show_warning "Defragmentation had issues, but conversion is complete"
-                sleep 2
+                log_message "Defragmentation had issues, but conversion is complete" "warning"
+                sleep 1
             fi
             ;;
         *)
-            # User skipped defrag
-            show_info "Skipping defragmentation."
+            log_message "Skipping defragmentation" "info"
             sleep 1
             ;;
     esac
@@ -926,17 +1752,69 @@ shrink_ntfs() {
     local partition="$1"
     local target_size="$2"
     
-    show_info "Shrinking NTFS partition $partition to ${target_size}KB"
+    log_message "Preparing to shrink NTFS partition $partition to ${target_size}KB" "info"
+    update_status_bar "Shrinking NTFS partition..."
     
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] Would run: ntfsresize -s ${target_size}K -f $partition"
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 2  # Simulate operation time
+        log_message "NTFS partition shrink simulated (dummy mode)" "success"
         return 0
     fi
     
-    if ! ntfsresize -s "${target_size}K" -f "$partition" >/dev/null 2>&1; then
-        show_error "Failed to shrink NTFS partition"
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY RUN] Would run: ntfsresize -s ${target_size}K $partition" "info"
+        return 0
+    fi
+    
+    # Safety check: Verify partition is not mounted
+    if findmnt -n "$partition" >/dev/null 2>&1; then
+        local mount_point
+        mount_point=$(findmnt -n -o TARGET "$partition" 2>/dev/null || echo "unknown")
+        show_error "Partition $partition is mounted at $mount_point. Cannot resize while mounted." false
+        log_message "Attempting to unmount $partition..." "warning"
+        
+        if ! umount "$partition" 2>/dev/null; then
+            show_error "Failed to unmount $partition. Please unmount manually and try again."
+            return 1
+        fi
+        sync
+        sleep 1
+        log_message "Partition unmounted successfully" "success"
+    fi
+    
+    # Safety check: Verify partition exists and is NTFS
+    if ! blkid "$partition" 2>/dev/null | grep -qi "ntfs"; then
+        show_error "Partition $partition does not appear to be NTFS"
         return 1
     fi
+    
+    # First, run ntfsresize in dry-run mode to validate the operation
+    log_message "Validating resize operation (dry-run)..." "info"
+    local dry_run_output
+    dry_run_output=$(ntfsresize -n -s "${target_size}K" "$partition" 2>&1)
+    local dry_run_status=$?
+    
+    if [ $dry_run_status -ne 0 ]; then
+        show_error "NTFS resize validation failed. The operation would be unsafe." false
+        log_message "ntfsresize dry-run output: $dry_run_output" "error"
+        return 1
+    fi
+    
+    log_message "Validation passed. Proceeding with resize..." "success"
+    
+    # Perform the actual resize (without -f flag for safety)
+    log_message "Resizing NTFS filesystem..." "info"
+    local resize_output
+    resize_output=$(ntfsresize -s "${target_size}K" "$partition" 2>&1)
+    local resize_status=$?
+    
+    if [ $resize_status -ne 0 ]; then
+        show_error "Failed to resize NTFS filesystem" false
+        log_message "ntfsresize output: $resize_output" "error"
+        return 1
+    fi
+    
+    log_message "NTFS filesystem resized successfully" "success"
     
     # Resize partition table entry
     local part_num
@@ -944,8 +1822,25 @@ shrink_ntfs() {
     local disk
     disk=$(echo "$partition" | sed 's/[0-9]*$//')
     
-    parted "$disk" resizepart "$part_num" "${target_size}KB" >/dev/null 2>&1 || true
+    log_message "Updating partition table..." "info"
+    local parted_output
+    parted_output=$(parted "$disk" resizepart "$part_num" "${target_size}KB" 2>&1)
+    local parted_status=$?
     
+    if [ $parted_status -ne 0 ]; then
+        show_warning "Partition table update may have failed: $parted_output" false
+        # Don't return error - filesystem was resized, partition table is secondary
+    else
+        log_message "Partition table updated" "success"
+    fi
+    
+    # Sync and wait for kernel to update
+    sync
+    sleep 1
+    partprobe "$disk" >/dev/null 2>&1 || true
+    sleep 1
+    
+    log_message "NTFS partition shrink completed" "success"
     return 0
 }
 
@@ -954,42 +1849,123 @@ create_partition() {
     local start="$2"
     local end="$3"
     
-    show_info "Creating partition on $disk from ${start}KB to ${end}KB"
+    log_message "Creating partition on $disk from ${start}KB to ${end}KB" "info"
+    update_status_bar "Creating partition..."
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1  # Simulate operation time
+        log_message "Partition created (dummy mode): ${disk}2" "success"
+        echo "${disk}2"  # Return dummy partition
+        return 0
+    fi
     
     if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] Would run: parted $disk mkpart primary ${start}KB ${end}KB"
+        log_message "[DRY RUN] Would run: parted $disk mkpart primary ${start}KB ${end}KB" "info"
         echo "/dev/sdXY"  # Dummy output
         return 0
     fi
     
-    local part_num
-    part_num=$(parted "$disk" -s mkpart primary "${start}KB" "${end}KB" | tail -1 | awk '{print $NF}')
+    # Get list of existing partitions before creating new one
+    local existing_parts
+    existing_parts=$(lsblk -ln -o NAME "$disk" 2>/dev/null | grep -v "^$(basename "$disk")$" | sort)
+    
+    # Create the partition
+    local parted_output
+    parted_output=$(parted "$disk" -s mkpart primary "${start}KB" "${end}KB" 2>&1)
+    local parted_status=$?
+    
+    if [ $parted_status -ne 0 ]; then
+        log_message "Failed to create partition: $parted_output" "error"
+        return 1
+    fi
     
     # Wait for kernel to recognize new partition
+    sync
     sleep 1
     partprobe "$disk" >/dev/null 2>&1 || true
-    sleep 1
+    sleep 2
     
-    echo "${disk}${part_num}"
+    # Find the new partition by comparing before/after
+    local new_parts
+    new_parts=$(lsblk -ln -o NAME "$disk" 2>/dev/null | grep -v "^$(basename "$disk")$" | sort)
+    
+    local new_partition=""
+    while IFS= read -r part; do
+        if ! echo "$existing_parts" | grep -q "^${part}$"; then
+            new_partition="/dev/$part"
+            break
+        fi
+    done <<< "$new_parts"
+    
+    # Fallback: try to detect partition number from disk
+    if [ -z "$new_partition" ]; then
+        # Count existing partitions and assume new one is next
+        local part_count
+        part_count=$(lsblk -ln -o NAME "$disk" 2>/dev/null | grep -v "^$(basename "$disk")$" | wc -l)
+        new_partition="${disk}${part_count}"
+        
+        # Verify it exists
+        if [ ! -b "$new_partition" ]; then
+            # Try with 'p' prefix (for nvme, mmcblk devices)
+            new_partition="${disk}p${part_count}"
+        fi
+    fi
+    
+    # Verify partition was created
+    if [ ! -b "$new_partition" ]; then
+        log_message "Failed to detect new partition after creation" "error"
+        return 1
+    fi
+    
+    log_message "Partition created: $new_partition" "success"
+    echo "$new_partition"
 }
 
 format_filesystem() {
     local partition="$1"
     local fs_type="$2"
     
-    show_info "Formatting $partition as $fs_type"
+    log_message "Formatting $partition as $fs_type" "info"
+    update_status_bar "Formatting filesystem..."
     
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] Would run: ${FS_FORMAT_CMD[$fs_type]} $partition"
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 2  # Simulate formatting time
+        log_message "Filesystem formatted (dummy mode)" "success"
         return 0
     fi
     
-    local format_cmd="${FS_FORMAT_CMD[$fs_type]}"
-    if ! $format_cmd "$partition" >/dev/null 2>&1; then
-        show_error "Failed to format partition as $fs_type"
+    if [ "$DRY_RUN" = true ]; then
+        log_message "[DRY RUN] Would run: ${FS_FORMAT_CMD[$fs_type]} $partition" "info"
+        return 0
+    fi
+    
+    # Verify partition exists
+    if [ ! -b "$partition" ]; then
+        log_message "Partition $partition does not exist" "error"
         return 1
     fi
     
+    # Safety check: verify partition is not mounted
+    if findmnt -n "$partition" >/dev/null 2>&1; then
+        log_message "Partition $partition is mounted. Cannot format." "error"
+        return 1
+    fi
+    
+    local format_cmd="${FS_FORMAT_CMD[$fs_type]}"
+    local format_output
+    format_output=$($format_cmd "$partition" 2>&1)
+    local format_status=$?
+    
+    if [ $format_status -ne 0 ]; then
+        log_message "Failed to format partition: $format_output" "error"
+        return 1
+    fi
+    
+    # Sync to ensure filesystem is written
+    sync
+    sleep 1
+    
+    log_message "Filesystem formatted successfully as $fs_type" "success"
     return 0
 }
 
@@ -998,7 +1974,12 @@ expand_filesystem() {
     local mount_point="$2"
     local fs_type="$3"
     
-    show_info "Expanding $fs_type filesystem on $partition"
+    show_info_auto "Expanding $fs_type filesystem on $partition" 1
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1  # Simulate operation time
+        return 0
+    fi
     
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY RUN] Would expand filesystem"
@@ -1047,11 +2028,15 @@ expand_filesystem() {
 
 # Wait for I/O operations to complete
 wait_for_io_completion() {
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1  # Simulate wait time
+        return 0
+    fi
     local max_wait=30  # Maximum 30 seconds
     local wait_time=0
     local interval=1
     
-    show_info "Waiting for I/O operations to complete..."
+    show_info_auto "Waiting for I/O operations to complete..." 1
     
     while [ $wait_time -lt $max_wait ]; do
         # Check for pending I/O using /proc/diskstats
@@ -1088,48 +2073,79 @@ wait_for_io_completion() {
 }
 
 # Comprehensive file verification - verifies all migrated files match source
+# Enhanced: checksums files > 100KB, uses xxhash if available, shows progress in status bar
 verify_file_migration() {
     local source_mount="$1"
     local dest_mount="$2"
     local verify_list_file="$3"  # Output file with list of verified files
     
-    show_info "Comprehensively verifying file migration..."
+    log_message "Starting comprehensive file verification..." "info"
+    update_status_bar "Verifying files..." "0%"
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        # Simulate verification
+        sleep 2
+        echo "dummy_file1.txt" > "$verify_list_file"
+        echo "dummy_file2.txt" >> "$verify_list_file"
+        log_message "Verification simulated (dummy mode)" "success"
+        return 0
+    fi
     
     # Count files in source and destination
+    log_message "Counting files..." "info"
     local source_files
     source_files=$(find "$source_mount" -type f 2>/dev/null | wc -l)
     local dest_files
     dest_files=$(find "$dest_mount" -type f 2>/dev/null | wc -l)
     
     if [ $source_files -eq 0 ]; then
-        show_info "No files to verify in source"
-        touch "$verify_list_file"  # Create empty list
+        log_message "No files to verify in source" "info"
+        touch "$verify_list_file"
         return 0
     fi
     
+    log_message "Source: $source_files files, Destination: $dest_files files" "info"
+    
     # Check if destination has reasonable number of files
     if [ $dest_files -lt $((source_files / 2)) ]; then
-        show_error "File count mismatch: Source has $source_files files, destination has $dest_files files"
-        show_error "Not enough files migrated. Aborting verification."
+        log_message "File count mismatch: Source $source_files, Destination $dest_files" "error"
+        log_message "Not enough files migrated. Aborting verification." "error"
         return 1
     fi
     
-    # Get checksum command (prefer sha256sum, fallback to md5sum)
+    # Get checksum command (prefer xxhash for speed, fallback to sha256sum, then md5sum)
     local checksum_cmd=""
-    if command -v sha256sum >/dev/null 2>&1; then
+    local checksum_name=""
+    if command -v xxhsum >/dev/null 2>&1; then
+        checksum_cmd="xxhsum"
+        checksum_name="xxhash"
+    elif command -v xxh64sum >/dev/null 2>&1; then
+        checksum_cmd="xxh64sum"
+        checksum_name="xxhash64"
+    elif command -v sha256sum >/dev/null 2>&1; then
         checksum_cmd="sha256sum"
+        checksum_name="sha256"
     elif command -v md5sum >/dev/null 2>&1; then
         checksum_cmd="md5sum"
+        checksum_name="md5"
     fi
     
-    show_info "Verifying all migrated files (this may take a while)..."
-    show_info "Source files: $source_files, Destination files: $dest_files"
+    if [ -n "$checksum_cmd" ]; then
+        log_message "Using $checksum_name for integrity verification" "info"
+    else
+        log_message "No checksum tool available, using size-only verification" "warning"
+    fi
     
     local verified_count=0
     local failed_count=0
     local missing_count=0
+    local checksum_count=0
     local total_checked=0
     local verify_list=()
+    local last_progress_update=0
+    
+    # Checksum threshold: 100KB (102400 bytes) - balance between safety and speed
+    local checksum_threshold=102400
     
     # Verify each file in source
     while IFS= read -r source_file; do
@@ -1140,9 +2156,11 @@ verify_file_migration() {
         rel_path="${source_file#$source_mount/}"
         local dest_file="$dest_mount/$rel_path"
         
-        # Show progress every 100 files
-        if [ $((total_checked % 100)) -eq 0 ]; then
-            printf "\r${CYAN}Verified: $verified_count, Failed: $failed_count, Missing: $missing_count, Total: $total_checked/$source_files${RESET}"
+        # Update progress in status bar (every 50 files or every 2%)
+        local progress_percent=$((total_checked * 100 / source_files))
+        if [ $((total_checked % 50)) -eq 0 ] || [ $progress_percent -ne $last_progress_update ]; then
+            update_status_bar "Verifying: $verified_count OK, $failed_count failed" "${progress_percent}%"
+            last_progress_update=$progress_percent
         fi
         
         if [ ! -f "$dest_file" ]; then
@@ -1152,26 +2170,25 @@ verify_file_migration() {
         
         # Compare file sizes first (fast check)
         local source_size dest_size
-        source_size=$(stat -f%z "$source_file" 2>/dev/null || stat -c%s "$source_file" 2>/dev/null || echo 0)
-        dest_size=$(stat -f%z "$dest_file" 2>/dev/null || stat -c%s "$dest_file" 2>/dev/null || echo 0)
+        source_size=$(stat -c%s "$source_file" 2>/dev/null || stat -f%z "$source_file" 2>/dev/null || echo 0)
+        dest_size=$(stat -c%s "$dest_file" 2>/dev/null || stat -f%z "$dest_file" 2>/dev/null || echo 0)
         
-        # Check if sizes match (empty files with size 0 are valid)
+        # Check if sizes match
         if [ "$source_size" != "$dest_size" ]; then
             failed_count=$((failed_count + 1))
             continue
         fi
         
-        # If both files are empty (size 0), they match - no need for checksum
+        # If both files are empty (size 0), they match
         if [ "$source_size" -eq 0 ]; then
             verified_count=$((verified_count + 1))
             verify_list+=("$rel_path")
             continue
         fi
         
-        # For files > 1MB, verify with checksum (more thorough)
-        # For smaller files, size match is sufficient
+        # For files > 100KB, verify with checksum
         local verify_checksum=false
-        if [ "$source_size" -gt 1048576 ] && [ -n "$checksum_cmd" ]; then
+        if [ "$source_size" -gt "$checksum_threshold" ] && [ -n "$checksum_cmd" ]; then
             verify_checksum=true
         fi
         
@@ -1180,11 +2197,9 @@ verify_file_migration() {
             source_hash=$($checksum_cmd "$source_file" 2>/dev/null | cut -d' ' -f1)
             dest_hash=$($checksum_cmd "$dest_file" 2>/dev/null | cut -d' ' -f1)
             
-            # If checksum calculation failed, fall back to size-only verification
-            # (this can happen with very large files or filesystem issues)
+            # If checksum calculation failed, fall back to size-only
             if [ -z "$source_hash" ] || [ -z "$dest_hash" ]; then
-                show_warning "Checksum calculation failed for file, using size verification only: $rel_path"
-                # Size already matches, so consider it verified
+                # Size already matches, consider it verified
                 verified_count=$((verified_count + 1))
                 verify_list+=("$rel_path")
                 continue
@@ -1194,15 +2209,18 @@ verify_file_migration() {
                 failed_count=$((failed_count + 1))
                 continue
             fi
+            
+            checksum_count=$((checksum_count + 1))
         fi
         
-        # File verified - add to list
+        # File verified
         verified_count=$((verified_count + 1))
         verify_list+=("$rel_path")
         
     done < <(find "$source_mount" -type f 2>/dev/null)
     
-    printf "\r${GREEN}Verified: $verified_count, Failed: $failed_count, Missing: $missing_count, Total: $total_checked${RESET}\n"
+    # Final status update
+    update_status_bar "Verification complete" "100%"
     
     # Save verified file list
     if [ ${#verify_list[@]} -gt 0 ]; then
@@ -1211,19 +2229,26 @@ verify_file_migration() {
         touch "$verify_list_file"
     fi
     
-    # Verification results
-    local success_rate=$((verified_count * 100 / total_checked))
+    # Calculate success rate
+    local success_rate=0
+    if [ $total_checked -gt 0 ]; then
+        success_rate=$((verified_count * 100 / total_checked))
+    fi
     
+    # Report results
+    log_message "Verification complete: $verified_count/$total_checked files ($success_rate%)" "info"
+    log_message "Checksummed: $checksum_count, Failed: $failed_count, Missing: $missing_count" "info"
+    
+    # Check for failures
     if [ $failed_count -gt 0 ] || [ $missing_count -gt $((total_checked / 10)) ]; then
-        show_error "File verification failed!"
-        show_error "Verified: $verified_count/$total_checked ($success_rate%)"
-        show_error "Failed: $failed_count, Missing: $missing_count"
+        log_message "File verification FAILED" "error"
+        log_message "Too many failed or missing files for safe continuation" "error"
         return 1
     fi
     
     if [ $verified_count -lt $((total_checked * 9 / 10)) ]; then
-        show_warning "Low verification rate: $verified_count/$total_checked ($success_rate%)"
-        show_warning "Less than 90% of files verified. Proceed with caution."
+        log_message "Low verification rate: $success_rate%" "warning"
+        log_message "Less than 90% of files verified" "warning"
         local options=("Yes, continue anyway" "No, abort")
         local user_choice
         user_choice=$(show_menu "Continue with low verification rate?" "${options[@]}")
@@ -1232,7 +2257,7 @@ verify_file_migration() {
         fi
     fi
     
-    show_success "File verification complete: $verified_count/$total_checked files verified ($success_rate%)"
+    log_message "File verification successful: $success_rate%" "success"
     return 0
 }
 
@@ -1250,11 +2275,16 @@ remove_verified_source_files() {
     file_count=$(wc -l < "$verify_list_file" 2>/dev/null || echo 0)
     
     if [ $file_count -eq 0 ]; then
-        show_info "No verified files to remove from source"
+        show_info_auto "No verified files to remove from source" 1
         return 0
     fi
     
-    show_info "Removing $file_count verified files from NTFS source..."
+    show_info_auto "Removing $file_count verified files from NTFS source..." 1
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1  # Simulate removal time
+        return 0
+    fi
     
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY RUN] Would remove $file_count files from $source_mount"
@@ -1291,7 +2321,12 @@ remove_verified_source_files() {
 
 # Sync filesystem and wait for completion
 sync_filesystems() {
-    show_info "Syncing filesystems to ensure all data is written..."
+    show_info_auto "Syncing filesystems to ensure all data is written..." 1
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1  # Simulate sync time
+        return 0
+    fi
     
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY RUN] Would run: sync"
@@ -1327,10 +2362,20 @@ migrate_files() {
     local source="$1"
     local dest="$2"
     
-    show_info "Migrating files from $source to $dest"
+    log_message "Preparing to migrate files from $source to $dest" "info"
+    update_status_bar "Migrating files..."
+    
+    if [ "$DUMMY_MODE" = true ]; then
+        # Simulate file migration with progress
+        log_message "Simulating file migration (dummy mode)..." "info"
+        sleep 3  # Simulate migration time
+        FILES_MIGRATED=$((FILES_MIGRATED + 1000))  # Simulate files migrated
+        log_message "Migration simulation complete" "success"
+        return 0
+    fi
     
     if [ "$DRY_RUN" = true ]; then
-        echo "[DRY RUN] Would run: rsync -avx --progress $source/ $dest/"
+        log_message "[DRY RUN] Would run: rsync -avx --progress $source/ $dest/" "info"
         return 0
     fi
     
@@ -1339,124 +2384,165 @@ migrate_files() {
     TARGET_MOUNT="/mnt/target_$$"
     mkdir -p "$NTFS_MOUNT" "$TARGET_MOUNT"
     
-    # Mount partitions
-    if ! mount "$source" "$NTFS_MOUNT" 2>/dev/null; then
-        show_error "Failed to mount source partition $source"
+    # Mount source partition
+    log_message "Mounting source partition $source" "info"
+    local mount_output
+    mount_output=$(mount "$source" "$NTFS_MOUNT" 2>&1)
+    if [ $? -ne 0 ]; then
+        log_message "Failed to mount source partition: $mount_output" "error"
+        rmdir "$NTFS_MOUNT" "$TARGET_MOUNT" 2>/dev/null || true
         return 1
     fi
     
-    if ! mount "$dest" "$TARGET_MOUNT" 2>/dev/null; then
-        show_error "Failed to mount target partition $dest"
+    # Mount target partition
+    log_message "Mounting target partition $dest" "info"
+    mount_output=$(mount "$dest" "$TARGET_MOUNT" 2>&1)
+    if [ $? -ne 0 ]; then
+        log_message "Failed to mount target partition: $mount_output" "error"
         umount "$NTFS_MOUNT" 2>/dev/null || true
+        rmdir "$NTFS_MOUNT" "$TARGET_MOUNT" 2>/dev/null || true
         return 1
     fi
     
-    # Migrate files with progress
-    local width
-    width=$(get_terminal_size | cut -d' ' -f1)
-    
-    clear_screen
-    print_header
-    
-    local box_content=""
-    box_content+="${CYAN}Migrating files...${RESET}\n"
-    box_content+="\n"
-    box_content+="Source: ${BOLD}$source${RESET}\n"
-    box_content+="Target: ${BOLD}$dest${RESET}\n"
-    box_content+="\n"
-    box_content+="Progress: [                    ] 0%\n"
-    box_content+="\n"
-    box_content+="Files: 0\n"
-    box_content+="Data: 0 B\n"
-    
-    draw_box "$width" "File Migration" "$box_content"
-    
-    # Use rsync to migrate files
-    # Count files first for progress
+    # Count files for progress
+    log_message "Counting files to migrate..." "info"
     local total_files
     total_files=$(find "$NTFS_MOUNT" -type f 2>/dev/null | wc -l)
-    local migrated_files=0
+    local total_size
+    total_size=$(du -sk "$NTFS_MOUNT" 2>/dev/null | cut -f1)
+    log_message "Found $total_files files (${total_size}KB) to migrate" "info"
     
-    # Migrate files, excluding already migrated ones (check by comparing)
-    rsync -avx --info=progress2 --human-readable \
-        "$NTFS_MOUNT/" "$TARGET_MOUNT/" 2>&1 | \
-    while IFS= read -r line; do
-        # Update progress display
-        if echo "$line" | grep -q "to-check="; then
-            # Extract progress info
-            local progress_info
-            progress_info=$(echo "$line" | grep -oE '[0-9]+%' | head -1 | sed 's/%//')
-            if [ -n "$progress_info" ]; then
-                local cols
-                cols=$(get_terminal_size | cut -d' ' -f1)
-                tput cup 8 0 2>/dev/null || true
-                printf "Progress: "
-                draw_progress_bar "$progress_info" 100
-                printf "\n"
+    # Perform rsync migration
+    # Use a temporary file to capture rsync output and exit status
+    local rsync_log="/tmp/rsync_log_$$.txt"
+    local rsync_status_file="/tmp/rsync_status_$$.txt"
+    
+    log_message "Starting file migration with rsync..." "info"
+    update_status_bar "Migrating $total_files files..."
+    
+    # Run rsync in background and capture status
+    (
+        rsync -avx --info=progress2 --human-readable \
+            "$NTFS_MOUNT/" "$TARGET_MOUNT/" > "$rsync_log" 2>&1
+        echo $? > "$rsync_status_file"
+    ) &
+    local rsync_pid=$!
+    
+    # Monitor progress while rsync runs
+    local last_progress=0
+    while kill -0 $rsync_pid 2>/dev/null; do
+        if [ -f "$rsync_log" ]; then
+            # Extract progress percentage from rsync output
+            local current_progress
+            current_progress=$(tail -n 5 "$rsync_log" 2>/dev/null | grep -oE '[0-9]+%' | tail -1 | tr -d '%')
+            if [ -n "$current_progress" ] && [ "$current_progress" != "$last_progress" ]; then
+                update_status_bar "Migrating files..." "${current_progress}%"
+                last_progress="$current_progress"
             fi
         fi
-        
-        # Count files
-        if echo "$line" | grep -qE '^[^/]+/[^/]+'; then
-            migrated_files=$((migrated_files + 1))
-            FILES_MIGRATED=$((FILES_MIGRATED + 1))
-        fi
+        sleep 1
     done
     
-    # Sync filesystems to ensure all data is written before verification
+    # Wait for rsync to complete
+    wait $rsync_pid 2>/dev/null
+    
+    # Get rsync exit status
+    local rsync_status=1
+    if [ -f "$rsync_status_file" ]; then
+        rsync_status=$(cat "$rsync_status_file")
+    fi
+    
+    # Clean up temp files
+    rm -f "$rsync_log" "$rsync_status_file" 2>/dev/null
+    
+    # Check rsync result
+    # Exit codes: 0 = success, 24 = partial transfer (vanished files - OK for our use)
+    if [ "$rsync_status" -ne 0 ] && [ "$rsync_status" -ne 24 ]; then
+        log_message "rsync failed with exit code $rsync_status" "error"
+        umount "$NTFS_MOUNT" "$TARGET_MOUNT" 2>/dev/null || true
+        rmdir "$NTFS_MOUNT" "$TARGET_MOUNT" 2>/dev/null || true
+        return 1
+    fi
+    
+    if [ "$rsync_status" -eq 24 ]; then
+        log_message "rsync completed with some vanished files (normal for active filesystems)" "warning"
+    else
+        log_message "rsync completed successfully" "success"
+    fi
+    
+    # Sync filesystems to ensure all data is written
+    log_message "Syncing filesystems..." "info"
     sync_filesystems
     
     # Create verification list file
     local verify_list_file="/tmp/verified_files_$$.txt"
     
-    # Comprehensive verification - verify ALL files match before removing source
-    show_info "Verifying all migrated files match source before clearing NTFS space..."
+    # Comprehensive verification
+    log_message "Verifying migrated files..." "info"
+    update_status_bar "Verifying files..."
     if ! verify_file_migration "$NTFS_MOUNT" "$TARGET_MOUNT" "$verify_list_file"; then
-        show_error "File verification failed! Source files will NOT be removed."
-        show_error "Please check the migration and try again."
-        # Cleanup
+        log_message "File verification failed! Source files will NOT be removed." "error"
         rm -f "$verify_list_file" 2>/dev/null || true
         umount "$NTFS_MOUNT" "$TARGET_MOUNT" 2>/dev/null || true
         rmdir "$NTFS_MOUNT" "$TARGET_MOUNT" 2>/dev/null || true
         return 1
     fi
     
-    # Only remove source files that were verified
-    show_info "Removing verified source files from NTFS partition..."
+    # Remove verified source files
+    log_message "Removing verified source files from NTFS partition..." "info"
+    update_status_bar "Removing source files..."
     if ! remove_verified_source_files "$NTFS_MOUNT" "$verify_list_file"; then
-        show_error "Failed to remove verified source files"
+        log_message "Warning: Some source files could not be removed" "warning"
         # Continue anyway - files are verified on destination
     fi
     
     # Cleanup verification list
     rm -f "$verify_list_file" 2>/dev/null || true
     
-    # Sync again after removing source files
-    show_info "Syncing after source file removal..."
+    # Sync after removing source files
+    log_message "Syncing after source file removal..." "info"
     sync_filesystems
     
     # Final sync before unmounting
-    show_info "Final sync before unmounting..."
+    log_message "Final sync..." "info"
     sync
     sleep 1
     
     # Unmount with verification
-    show_info "Unmounting partitions..."
+    log_message "Unmounting partitions..." "info"
     local unmount_failed=false
     
-    if ! umount "$NTFS_MOUNT" 2>/dev/null; then
-        show_error "Failed to unmount $NTFS_MOUNT"
-        unmount_failed=true
-    fi
+    # Try unmounting with multiple attempts
+    local unmount_attempts=3
+    local attempt
     
-    if ! umount "$TARGET_MOUNT" 2>/dev/null; then
-        show_error "Failed to unmount $TARGET_MOUNT"
-        unmount_failed=true
-    fi
+    for ((attempt=1; attempt<=unmount_attempts; attempt++)); do
+        if umount "$NTFS_MOUNT" 2>/dev/null; then
+            break
+        fi
+        if [ $attempt -eq $unmount_attempts ]; then
+            log_message "Failed to unmount $NTFS_MOUNT after $unmount_attempts attempts" "error"
+            unmount_failed=true
+        else
+            sleep 2
+        fi
+    done
+    
+    for ((attempt=1; attempt<=unmount_attempts; attempt++)); do
+        if umount "$TARGET_MOUNT" 2>/dev/null; then
+            break
+        fi
+        if [ $attempt -eq $unmount_attempts ]; then
+            log_message "Failed to unmount $TARGET_MOUNT after $unmount_attempts attempts" "error"
+            unmount_failed=true
+        else
+            sleep 2
+        fi
+    done
     
     # Verify unmount succeeded
     if mountpoint -q "$NTFS_MOUNT" 2>/dev/null || mountpoint -q "$TARGET_MOUNT" 2>/dev/null; then
-        show_error "Partitions are still mounted after unmount attempt"
+        log_message "Partitions are still mounted after unmount attempt" "error"
         unmount_failed=true
     fi
     
@@ -1465,14 +2551,15 @@ migrate_files() {
     rmdir "$TARGET_MOUNT" 2>/dev/null || true
     
     if [ "$unmount_failed" = true ]; then
-        show_error "Unmount verification failed. Please check manually."
+        log_message "Unmount verification failed. Please check manually." "error"
         return 1
     fi
     
     # Final sync after unmount
     sync
     
-    show_success "File migration completed, verified, and source files safely removed"
+    log_message "File migration completed successfully" "success"
+    update_status_bar "Migration complete"
     return 0
 }
 
@@ -1482,6 +2569,19 @@ migrate_files() {
 
 get_partition_size_kb() {
     local partition="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        # Simulate shrinking over iterations
+        local current_size=$DUMMY_NTFS_SIZE_KB
+        if [ $DUMMY_ITERATION -gt 0 ]; then
+            # Reduce size by 20% each iteration
+            current_size=$((DUMMY_NTFS_SIZE_KB - (DUMMY_ITERATION * DUMMY_NTFS_SIZE_KB / 5)))
+            if [ $current_size -lt $DUMMY_NTFS_USED_KB ]; then
+                current_size=$DUMMY_NTFS_USED_KB
+            fi
+        fi
+        echo $current_size
+        return 0
+    fi
     local disk
     disk=$(echo "$partition" | sed 's/[0-9]*$//')
     local part_num
@@ -1494,6 +2594,10 @@ get_partition_size_kb() {
 
 get_partition_start_kb() {
     local partition="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        echo "1024"  # 1MB start
+        return 0
+    fi
     local disk
     disk=$(echo "$partition" | sed 's/[0-9]*$//')
     local part_num
@@ -1503,6 +2607,14 @@ get_partition_start_kb() {
 
 get_partition_end_kb() {
     local partition="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        local size_kb
+        size_kb=$(get_partition_size_kb "$partition")
+        local start_kb
+        start_kb=$(get_partition_start_kb "$partition")
+        echo $((start_kb + size_kb))
+        return 0
+    fi
     local disk
     disk=$(echo "$partition" | sed 's/[0-9]*$//')
     local part_num
@@ -1512,6 +2624,19 @@ get_partition_end_kb() {
 
 get_ntfs_used_space_kb() {
     local partition="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        # Simulate gradual reduction of used space over iterations
+        local current_used=$DUMMY_NTFS_USED_KB
+        if [ $DUMMY_ITERATION -gt 0 ]; then
+            # Reduce used space by 25% each iteration
+            current_used=$((DUMMY_NTFS_USED_KB - (DUMMY_ITERATION * DUMMY_NTFS_USED_KB / 4)))
+            if [ $current_used -lt 0 ]; then
+                current_used=0
+            fi
+        fi
+        echo $current_used
+        return 0
+    fi
     local mount_point="/mnt/ntfs_check_$$"
     
     mkdir -p "$mount_point"
@@ -1531,7 +2656,149 @@ get_ntfs_used_space_kb() {
 
 get_disk_end_kb() {
     local disk="$1"
+    if [ "$DUMMY_MODE" = true ]; then
+        echo $DUMMY_DISK_SIZE_KB
+        return 0
+    fi
     parted "$disk" unit KB print | grep "^Disk $disk" | awk '{print $3}' | sed 's/kB//'
+}
+
+###############################################################################
+# Pre-flight Checks
+###############################################################################
+
+# Perform safety checks before starting conversion
+preflight_checks() {
+    local disk="$1"
+    local ntfs_part="$2"
+    local target_fs="$3"
+    
+    # Skip preflight checks in dummy/dry-run mode
+    if [ "$DUMMY_MODE" = true ]; then
+        log_message "Pre-flight checks skipped (dummy mode)" "info"
+        return 0
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        log_message "Pre-flight checks skipped (dry-run mode)" "info"
+        return 0
+    fi
+    
+    log_message "Running pre-flight safety checks..." "info"
+    update_status_bar "Pre-flight checks..."
+    
+    local issues=()
+    local warnings=()
+    
+    # Check 1: Verify disk exists
+    if [ ! -b "$disk" ]; then
+        issues+=("Disk $disk does not exist or is not a block device")
+    fi
+    
+    # Check 2: Verify NTFS partition exists and is NTFS
+    if [ -n "$ntfs_part" ]; then
+        if [ ! -b "$ntfs_part" ]; then
+            issues+=("NTFS partition $ntfs_part does not exist")
+        elif ! blkid "$ntfs_part" 2>/dev/null | grep -qi "ntfs"; then
+            issues+=("$ntfs_part does not appear to be an NTFS partition")
+        fi
+        
+        # Check if mounted
+        if findmnt -n "$ntfs_part" >/dev/null 2>&1; then
+            local mount_point
+            mount_point=$(findmnt -n -o TARGET "$ntfs_part" 2>/dev/null)
+            warnings+=("NTFS partition $ntfs_part is mounted at $mount_point (will be unmounted)")
+        fi
+    fi
+    
+    # Check 3: Verify required tools are available
+    local required_tools=("parted" "rsync" "ntfsresize" "blkid" "findmnt")
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            issues+=("Required tool '$tool' is not installed")
+        fi
+    done
+    
+    # Check 4: Verify filesystem-specific tools
+    if [ -n "$target_fs" ]; then
+        local fs_tool=""
+        case "$target_fs" in
+            ext4) fs_tool="mkfs.ext4" ;;
+            btrfs) fs_tool="mkfs.btrfs" ;;
+            xfs) fs_tool="mkfs.xfs" ;;
+            f2fs) fs_tool="mkfs.f2fs" ;;
+            reiserfs) fs_tool="mkreiserfs" ;;
+            jfs) fs_tool="mkfs.jfs" ;;
+        esac
+        if [ -n "$fs_tool" ] && ! command -v "$fs_tool" >/dev/null 2>&1; then
+            issues+=("Filesystem tool '$fs_tool' for $target_fs is not installed")
+        fi
+    fi
+    
+    # Check 5: Verify disk has GPT or MBR partition table
+    if [ -b "$disk" ]; then
+        local part_table
+        part_table=$(parted "$disk" print 2>/dev/null | grep "Partition Table" | awk '{print $3}')
+        if [ -z "$part_table" ]; then
+            issues+=("Could not detect partition table on $disk")
+        elif [ "$part_table" != "gpt" ] && [ "$part_table" != "msdos" ]; then
+            warnings+=("Unusual partition table type: $part_table")
+        fi
+    fi
+    
+    # Check 6: Verify there's enough free space on disk for operations
+    if [ -b "$disk" ] && [ -n "$ntfs_part" ]; then
+        local disk_size_kb
+        disk_size_kb=$(parted "$disk" unit KB print 2>/dev/null | grep "^Disk" | head -1 | awk '{print $3}' | tr -d 'kBKB')
+        local ntfs_used_kb
+        
+        # Try to get NTFS used space
+        local temp_mount="/tmp/preflight_mount_$$"
+        mkdir -p "$temp_mount"
+        if mount -o ro "$ntfs_part" "$temp_mount" 2>/dev/null; then
+            ntfs_used_kb=$(df -k "$temp_mount" 2>/dev/null | tail -1 | awk '{print $3}')
+            umount "$temp_mount" 2>/dev/null || true
+            rmdir "$temp_mount" 2>/dev/null || true
+            
+            # Ensure there's at least 10% headroom
+            local min_space=$((ntfs_used_kb + ntfs_used_kb / 10))
+            if [ -n "$disk_size_kb" ] && [ "$disk_size_kb" -lt "$min_space" ]; then
+                issues+=("Disk may not have enough space for conversion (need ${min_space}KB, have ${disk_size_kb}KB)")
+            fi
+        else
+            rmdir "$temp_mount" 2>/dev/null || true
+            warnings+=("Could not mount NTFS partition read-only to check space")
+        fi
+    fi
+    
+    # Check 7: Verify no swap is active on the disk
+    if [ -b "$disk" ]; then
+        local swap_parts
+        swap_parts=$(swapon --show=NAME --noheadings 2>/dev/null | grep "$disk" || true)
+        if [ -n "$swap_parts" ]; then
+            issues+=("Swap is active on $swap_parts. Please disable swap first.")
+        fi
+    fi
+    
+    # Report results
+    if [ ${#issues[@]} -gt 0 ]; then
+        log_message "Pre-flight checks FAILED" "error"
+        for issue in "${issues[@]}"; do
+            log_message "ISSUE: $issue" "error"
+        done
+        return 1
+    fi
+    
+    if [ ${#warnings[@]} -gt 0 ]; then
+        log_message "Pre-flight checks passed with warnings" "warning"
+        for warning in "${warnings[@]}"; do
+            log_message "WARNING: $warning" "warning"
+        done
+    else
+        log_message "All pre-flight checks passed" "success"
+    fi
+    
+    return 0
 }
 
 ###############################################################################
@@ -1539,7 +2806,8 @@ get_disk_end_kb() {
 ###############################################################################
 
 main_conversion_loop() {
-    show_info "Starting conversion process..."
+    log_message "Starting conversion process..." "info"
+    update_status_bar "Starting conversion..."
     
     # Detect NTFS partition if not already set
     if [ -z "$NTFS_PARTITION" ]; then
@@ -1548,6 +2816,16 @@ main_conversion_loop() {
             show_error "No NTFS partition found on $SELECTED_DISK"
             exit 1
         fi
+    fi
+    
+    # Run pre-flight safety checks
+    if [ "$DUMMY_MODE" != true ]; then
+        if ! preflight_checks "$SELECTED_DISK" "$NTFS_PARTITION" "$TARGET_FILESYSTEM"; then
+            show_error "Pre-flight checks failed. Cannot proceed with conversion."
+            exit 1
+        fi
+    else
+        log_message "Skipping pre-flight checks (dummy mode)" "info"
     fi
     
     # Check for existing target filesystem partition
@@ -1585,14 +2863,16 @@ main_conversion_loop() {
     local no_progress_count=0
     local max_no_progress=3  # Allow 3 iterations with no progress before warning
     
+    # Estimate total iterations (rough estimate based on typical conversion)
+    local estimated_iterations=5
+    
     while true; do
         CURRENT_ITERATION=$iteration
         LAST_OPERATION="iteration_start"
         save_state
         
-        clear_screen
-        print_header
-        show_info "Iteration $((iteration + 1)): Analyzing NTFS partition..."
+        # Log iteration start
+        log_message "Iteration $((iteration + 1)): Analyzing NTFS partition..." "info"
         
         # Get NTFS used space
         local ntfs_used_kb
@@ -1602,19 +2882,40 @@ main_conversion_loop() {
         local ntfs_free_kb
         ntfs_free_kb=$((ntfs_size_kb - ntfs_used_kb))
         
-        show_info "NTFS: ${ntfs_used_kb}KB used, ${ntfs_free_kb}KB free out of ${ntfs_size_kb}KB total"
+        # Calculate progress percentage for this iteration
+        local iteration_progress=0
+        if [ $iteration -gt 0 ] && [ $previous_used_kb -gt 0 ]; then
+            local total_to_migrate=$previous_used_kb
+            local already_migrated=$((previous_used_kb - ntfs_used_kb))
+            if [ $total_to_migrate -gt 0 ]; then
+                iteration_progress=$((already_migrated * 100 / total_to_migrate))
+            fi
+        fi
         
-        # Check if NTFS is essentially empty (less than 1MB remaining)
-        # Use dynamic threshold based on disk size (0.1% of disk or 1MB, whichever is larger)
+        # Render progress panel
+        render_progress_panel \
+            "Converting: $NTFS_PARTITION -> $TARGET_FILESYSTEM" \
+            "$NTFS_PARTITION" \
+            "$TARGET_FILESYSTEM" \
+            "$((iteration + 1))" \
+            "$estimated_iterations" \
+            "$iteration_progress" \
+            "$FILES_MIGRATED" \
+            "0" \
+            "Analyzing partition..."
+        
+        log_message "NTFS: ${ntfs_used_kb}KB used, ${ntfs_free_kb}KB free (${ntfs_size_kb}KB total)" "info"
+        
+        # Check if NTFS is essentially empty
         local disk_size_kb
         disk_size_kb=$(get_disk_end_kb "$SELECTED_DISK")
-        local empty_threshold=$((disk_size_kb / 1000))  # 0.1% of disk
+        local empty_threshold=$((disk_size_kb / 1000))
         if [ $empty_threshold -lt 1024 ]; then
-            empty_threshold=1024  # Minimum 1MB
+            empty_threshold=1024
         fi
         
         if [ $ntfs_used_kb -lt $empty_threshold ]; then
-            show_info "NTFS partition is essentially empty (${ntfs_used_kb}KB < ${empty_threshold}KB). Proceeding to final steps..."
+            log_message "NTFS partition essentially empty. Proceeding to final steps..." "success"
             break
         fi
         
@@ -1622,27 +2923,22 @@ main_conversion_loop() {
         if [ $iteration -gt 0 ]; then
             local progress_kb=$((previous_used_kb - ntfs_used_kb))
             if [ $progress_kb -lt 1024 ]; then
-                # Less than 1MB progress
                 no_progress_count=$((no_progress_count + 1))
                 if [ $no_progress_count -ge $max_no_progress ]; then
-                    show_warning "No significant progress made in last $max_no_progress iterations"
-                    show_warning "Previous: ${previous_used_kb}KB, Current: ${ntfs_used_kb}KB"
+                    log_message "No significant progress in last $max_no_progress iterations" "warning"
+                    log_message "Previous: ${previous_used_kb}KB, Current: ${ntfs_used_kb}KB" "warning"
                     local options=("Yes, continue" "No, abort")
                     local user_choice
                     user_choice=$(show_menu "Continue anyway?" "${options[@]}")
-                    # user_choice: 0 = "Yes, continue", 1 = "No, abort", -1 = cancelled
                     if [ "$user_choice" = "-1" ] || [ "$user_choice" = "1" ]; then
-                        # User chose to abort or cancelled
-                        show_info "Aborting conversion"
+                        log_message "Aborting conversion" "info"
                         exit 1
                     fi
-                    # user_choice is 0, continue
-                    no_progress_count=0  # Reset counter
+                    no_progress_count=0
                 fi
             else
-                # Progress made, reset counter
                 no_progress_count=0
-                show_info "Progress: ${progress_kb}KB migrated in this iteration"
+                log_message "Progress: ${progress_kb}KB migrated in previous iteration" "success"
             fi
         fi
         
@@ -1663,8 +2959,7 @@ main_conversion_loop() {
                 rmdir "$target_mount"
                 
                 if [ $target_avail_kb -lt $ntfs_used_kb ]; then
-                    show_warning "Existing partition has insufficient space. Need ${ntfs_used_kb}KB, have ${target_avail_kb}KB"
-                    # Continue anyway, will migrate what fits
+                    log_message "Existing partition has insufficient space (need ${ntfs_used_kb}KB, have ${target_avail_kb}KB)" "warning"
                 fi
             fi
         else
@@ -1672,15 +2967,15 @@ main_conversion_loop() {
             LAST_OPERATION="shrink_ntfs"
             save_state
             
-            show_info "Shrinking NTFS partition to ${target_size_kb}KB..."
+            update_status_bar "Shrinking NTFS partition..." ""
             if ! shrink_ntfs "$NTFS_PARTITION" "$target_size_kb"; then
-                show_error "Failed to shrink NTFS partition"
+                log_message "Failed to shrink NTFS partition" "error"
                 exit 1
             fi
             
             # Create new partition if this is first iteration
             if [ $iteration -eq 0 ]; then
-                show_info "Creating target ${TARGET_FILESYSTEM} partition..."
+                update_status_bar "Creating target partition..." ""
                 
                 # Get new NTFS end position after shrink
                 local new_ntfs_end_kb
@@ -1697,7 +2992,7 @@ main_conversion_loop() {
                 TARGET_PARTITION=$(create_partition "$SELECTED_DISK" "$target_start_kb" "$target_end_kb")
                 
                 if [ -z "$TARGET_PARTITION" ]; then
-                    show_error "Failed to create target partition"
+                    log_message "Failed to create target partition" "error"
                     exit 1
                 fi
                 
@@ -1706,12 +3001,13 @@ main_conversion_loop() {
                 save_state
                 
                 if ! format_filesystem "$TARGET_PARTITION" "$TARGET_FILESYSTEM"; then
-                    show_error "Failed to format target partition"
+                    log_message "Failed to format target partition" "error"
                     exit 1
                 fi
             else
                 # In subsequent iterations, expand target partition into freed space
-                show_info "Expanding target partition into freed space..."
+                log_message "Expanding target partition into freed space..." "info"
+                update_status_bar "Expanding target partition..." ""
                 
                 local target_part_num
                 target_part_num=$(echo "$TARGET_PARTITION" | grep -o '[0-9]*$')
@@ -1722,9 +3018,11 @@ main_conversion_loop() {
                 LAST_OPERATION="expand_partition"
                 save_state
                 
-                if [ "$DRY_RUN" != true ]; then
+                if [ "$DUMMY_MODE" = true ]; then
+                    sleep 1  # Simulate partition expansion
+                elif [ "$DRY_RUN" != true ]; then
                     parted "$SELECTED_DISK" resizepart "$target_part_num" "${disk_end_kb}KB" >/dev/null 2>&1 || {
-                        show_warning "Failed to expand partition table entry"
+                        log_message "Failed to expand partition table entry" "warning"
                     }
                     sleep 1
                     partprobe "$SELECTED_DISK" >/dev/null 2>&1 || true
@@ -1751,18 +3049,17 @@ main_conversion_loop() {
         LAST_OPERATION="migrate_files"
         save_state
         
-        show_info "Migrating files from NTFS to ${TARGET_FILESYSTEM}..."
+        update_status_bar "Migrating files..." ""
         if ! migrate_files "$NTFS_PARTITION" "$TARGET_PARTITION"; then
-            show_error "Failed to migrate files"
+            log_message "Failed to migrate files" "error"
             exit 1
         fi
         
-        # Wait for all operations to complete before checking remaining space
-        show_info "Waiting for all file operations to complete..."
+        # Wait for all operations to complete
+        log_message "Waiting for file operations to complete..." "info"
         sync_filesystems
         
         # Verify migration and check remaining files
-        # Re-check after sync to ensure accurate measurement
         local remaining_kb
         remaining_kb=$(get_ntfs_used_space_kb "$NTFS_PARTITION")
         
@@ -1770,36 +3067,37 @@ main_conversion_loop() {
         local migrated_this_iteration=$((ntfs_used_kb - remaining_kb))
         
         if [ $remaining_kb -ge $ntfs_used_kb ]; then
-            show_warning "File migration may not have reduced NTFS usage."
-            show_warning "Previous: ${ntfs_used_kb}KB, Current: ${remaining_kb}KB"
-            # Still continue - may be filesystem metadata or small files
+            log_message "Migration may not have reduced NTFS usage (${ntfs_used_kb}KB -> ${remaining_kb}KB)" "warning"
         else
-            show_success "Migrated approximately ${migrated_this_iteration}KB in this iteration"
+            log_message "Migrated ${migrated_this_iteration}KB in this iteration" "success"
         fi
         
         # Use dynamic threshold based on disk size
         local disk_size_kb
         disk_size_kb=$(get_disk_end_kb "$SELECTED_DISK")
-        local continue_threshold=$((disk_size_kb / 100))  # 1% of disk
+        local continue_threshold=$((disk_size_kb / 100))
         if [ $continue_threshold -lt 10240 ]; then
-            continue_threshold=10240  # Minimum 10MB
+            continue_threshold=10240
         fi
         
         # If NTFS still has significant data, continue iteration
         if [ $remaining_kb -gt $continue_threshold ]; then
-            show_info "Remaining data (${remaining_kb}KB) exceeds threshold (${continue_threshold}KB). Continuing..."
+            log_message "Remaining: ${remaining_kb}KB (threshold: ${continue_threshold}KB). Continuing..." "info"
             iteration=$((iteration + 1))
-            # Small delay to ensure filesystem is ready
+            if [ "$DUMMY_MODE" = true ]; then
+                DUMMY_ITERATION=$iteration
+            fi
             sleep 1
             continue
         else
-            show_info "Remaining data (${remaining_kb}KB) is below threshold (${continue_threshold}KB). Proceeding to final steps..."
+            log_message "Data below threshold. Proceeding to final steps..." "success"
             break
         fi
     done
     
     # Final steps: delete NTFS and expand target
-    show_info "Finalizing conversion..."
+    log_message "Finalizing conversion..." "info"
+    update_status_bar "Finalizing..." ""
     
     # Delete NTFS partition
     LAST_OPERATION="delete_ntfs"
@@ -1810,10 +3108,12 @@ main_conversion_loop() {
     local disk
     disk=$(echo "$NTFS_PARTITION" | sed 's/[0-9]*$//')
     
-    show_info "Deleting NTFS partition $NTFS_PARTITION"
-    if [ "$DRY_RUN" != true ]; then
+    log_message "Deleting NTFS partition $NTFS_PARTITION" "info"
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1
+    elif [ "$DRY_RUN" != true ]; then
         parted "$disk" rm "$part_num" >/dev/null 2>&1 || {
-            show_error "Failed to delete NTFS partition"
+            log_message "Failed to delete NTFS partition" "error"
             exit 1
         }
     fi
@@ -1828,10 +3128,13 @@ main_conversion_loop() {
     local disk_end_kb
     disk_end_kb=$(get_disk_end_kb "$SELECTED_DISK")
     
-    show_info "Expanding partition table entry..."
-    if [ "$DRY_RUN" != true ]; then
+    log_message "Expanding partition table entry..." "info"
+    update_status_bar "Expanding partition..." ""
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1
+    elif [ "$DRY_RUN" != true ]; then
         parted "$SELECTED_DISK" resizepart "$target_part_num" "${disk_end_kb}KB" >/dev/null 2>&1 || {
-            show_warning "Failed to expand partition table entry"
+            log_message "Failed to expand partition table entry" "warning"
         }
         
         # Wait for kernel to recognize change
@@ -1841,19 +3144,22 @@ main_conversion_loop() {
     fi
     
     # Expand filesystem
-    show_info "Expanding ${TARGET_FILESYSTEM} filesystem..."
+    log_message "Expanding ${TARGET_FILESYSTEM} filesystem..." "info"
+    update_status_bar "Expanding filesystem..." ""
     local temp_mount=""
-    if [ "${FS_RESIZE_REQUIRES_MOUNT[$TARGET_FILESYSTEM]}" = true ]; then
+    if [ "$DUMMY_MODE" = true ]; then
+        sleep 1
+    elif [ "${FS_RESIZE_REQUIRES_MOUNT[$TARGET_FILESYSTEM]}" = true ]; then
         temp_mount="/mnt/temp_expand_$$"
         mkdir -p "$temp_mount"
         mount "$TARGET_PARTITION" "$temp_mount" || {
-            show_error "Failed to mount partition for resize"
+            log_message "Failed to mount partition for resize" "error"
             exit 1
         }
     fi
     
     if ! expand_filesystem "$TARGET_PARTITION" "$temp_mount" "$TARGET_FILESYSTEM"; then
-        show_error "Failed to expand filesystem"
+        log_message "Failed to expand filesystem" "error"
         if [ -n "$temp_mount" ]; then
             umount "$temp_mount" 2>/dev/null || true
             rmdir "$temp_mount" 2>/dev/null || true
@@ -1869,10 +3175,17 @@ main_conversion_loop() {
     LAST_OPERATION="complete"
     save_state
     
-    show_success "Conversion completed successfully!"
-    show_info "NTFS partition has been converted to ${TARGET_FILESYSTEM}"
-    show_info "Total iterations: $((iteration + 1))"
-    show_info "Files migrated: $FILES_MIGRATED"
+    # Clear log and show completion summary
+    clear_log
+    log_message "Conversion completed successfully!" "success"
+    log_message "NTFS partition converted to ${TARGET_FILESYSTEM}" "success"
+    log_message "Total iterations: $((iteration + 1))" "info"
+    log_message "Files migrated: $FILES_MIGRATED" "info"
+    
+    update_status_bar "Conversion complete!" ""
+    
+    # Wait for user to see completion message
+    sleep 2
     
     # Offer defragmentation for the target filesystem if HDD
     check_and_offer_post_conversion_defrag "$SELECTED_DISK" "$TARGET_PARTITION" "$TARGET_FILESYSTEM"
@@ -1890,12 +3203,21 @@ main() {
                 DRY_RUN=true
                 shift
                 ;;
+            --dummy-mode)
+                DUMMY_MODE=true
+                shift
+                ;;
             -h|--help)
-                echo "Usage: $SCRIPT_NAME [--dry-run]"
+                echo "Usage: $SCRIPT_NAME [--dry-run] [--dummy-mode]"
+                echo ""
+                echo "Options:"
+                echo "  --dry-run    Run in dry-run mode - shows what would be done without making changes"
+                echo "  --dummy-mode Run in dummy mode - simulates interface and operations for testing"
+                echo "  -h, --help   Show this help message"
                 exit 0
                 ;;
             *)
-                show_error "Unknown option: $1"
+                echo "Error: Unknown option: $1" >&2
                 exit 1
                 ;;
         esac
@@ -1904,15 +3226,23 @@ main() {
     # Check root
     check_root
     
-    # Print welcome
-    print_header
-    show_info "Welcome to NTFS to Linux Filesystem Converter v${SCRIPT_VERSION}"
-    sleep 2
+    # Initialize the TUI screen
+    init_screen
+    
+    # Print welcome message
+    if [ "$DUMMY_MODE" = true ]; then
+        log_message "NTFS to Linux Filesystem Converter v${SCRIPT_VERSION}" "info"
+        log_message "Running in DUMMY MODE - no actual operations" "warning"
+    else
+        log_message "NTFS to Linux Filesystem Converter v${SCRIPT_VERSION}" "info"
+        log_message "Ready to convert NTFS partitions" "info"
+    fi
+    update_status_bar "Welcome" ""
+    sleep 1
     
     # Check for resume state
     if check_resume_state; then
-        show_info "Resuming from previous conversion..."
-        # Check dependencies for resumed filesystem
+        log_message "Resuming from previous conversion..." "info"
         if [ -n "$TARGET_FILESYSTEM" ]; then
             check_dependencies "$TARGET_FILESYSTEM"
         fi
@@ -1940,10 +3270,11 @@ main() {
     
     # Cleanup
     cleanup_state
+    cleanup_screen
 }
 
 # Trap signals for graceful exit
-trap 'save_state; exit 1' INT TERM
+trap 'cleanup_screen; save_state; exit 1' INT TERM
 
 # Run main function
 main "$@"
